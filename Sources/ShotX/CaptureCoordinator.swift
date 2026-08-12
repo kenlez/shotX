@@ -11,6 +11,20 @@ enum CaptureOverlayLayout {
         fixedWidth + edgeInset * 2 > visibleWidth
     }
 
+    static func toolbarSize(_ size: CGSize, visibleFrame: CGRect) -> CGSize {
+        let bounds = visibleFrame.insetBy(dx: edgeInset, dy: edgeInset)
+        return CGSize(width: min(size.width, bounds.width), height: min(size.height, bounds.height))
+    }
+
+    static func toolbarFrame(size: CGSize, selection: CGRect, visibleFrame: CGRect) -> CGRect {
+        let bounds = visibleFrame.insetBy(dx: edgeInset, dy: edgeInset)
+        let size = toolbarSize(size, visibleFrame: visibleFrame)
+        let below = selection.minY - size.height - edgeInset
+        let y = below >= bounds.minY ? below : min(bounds.maxY - size.height, max(bounds.minY, selection.maxY + edgeInset))
+        let x = min(max(bounds.minX, selection.midX - size.width / 2), bounds.maxX - size.width)
+        return CGRect(origin: CGPoint(x: x, y: y), size: size)
+    }
+
     static func optionsPanelSize(contentHeight: CGFloat, visibleFrame: CGRect) -> CGSize {
         CGSize(width: optionsWidth, height: min(max(120, contentHeight), max(1, visibleFrame.height - edgeInset * 2)))
     }
@@ -23,6 +37,21 @@ enum CaptureOverlayLayout {
         origin.x = min(max(bounds.minX, origin.x), max(bounds.minX, bounds.maxX - size.width))
         origin.y = min(max(bounds.minY, origin.y), max(bounds.minY, bounds.maxY - size.height))
         return CGRect(origin: origin, size: size)
+    }
+}
+
+enum AccessibilityAnnouncements {
+    static let interval: TimeInterval = 0.5
+
+    static func shouldPost(lastAnnouncementAt: Date?, now: Date = .now) -> Bool {
+        lastAnnouncementAt.map { now.timeIntervalSince($0) >= interval } ?? true
+    }
+
+    static func post(_ announcement: String, on element: Any) {
+        NSAccessibility.post(element: element, notification: .announcementRequested, userInfo: [
+            .announcement: announcement,
+            .priority: NSAccessibilityPriorityLevel.medium.rawValue
+        ])
     }
 }
 
@@ -278,6 +307,7 @@ final class SelectionView: NSView {
     private var brushSlider: BrushSlider?
     private var sizeValueLabel: NSTextField?
     private var optionsControls: [NSView] = []
+    private var lastStyleAnnouncementAt: Date?
     private var eyedropperMonitor: Any?
     private var eyedropperClickMonitor: Any?
     private var eyedropperKeyMonitor: Any?
@@ -509,16 +539,22 @@ final class SelectionView: NSView {
     private func makeToolbar() {
         let tools = NSSegmentedControl(labels: AnnotationTool.allCases.map(\.rawValue), trackingMode: .selectOne, target: self, action: #selector(toolChanged(_:)))
         tools.selectedSegment = 0
+        tools.controlSize = .small
+        for index in 0..<tools.segmentCount { tools.setWidth(32, forSegment: index) }
         toolControl = tools
         styleButton.target = self; styleButton.action = #selector(stylePressed); styleButton.setAccessibilityLabel("样式"); styleButton.toolTip = "样式"
-        styleButton.widthAnchor.constraint(equalToConstant: 84).isActive = true
-        let editButtons = [tools, button("撤销", #selector(undoPressed)), button("重做", #selector(redoPressed)), styleButton]
+        styleButton.controlSize = .small
+        styleButton.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        let undo = button("撤销", #selector(undoPressed)); undo.controlSize = .small
+        let redo = button("重做", #selector(redoPressed)); redo.controlSize = .small
+        let editButtons = [tools, undo, redo, styleButton]
         let outputButtons = [button("复制", #selector(copyPressed)), button("保存…", #selector(savePressed)), button("分享…", #selector(sharePressed)), button("贴图", #selector(pinPressed)), button("关闭", #selector(closePressed))]
-        let toolRow = NSStackView(views: editButtons); toolRow.orientation = .horizontal; toolRow.spacing = 7; toolRow.alignment = .centerY
-        let outputRow = NSStackView(views: outputButtons); outputRow.orientation = .horizontal; outputRow.spacing = 7; outputRow.alignment = .centerY
+        outputButtons.forEach { $0.controlSize = .small }
+        let toolRow = NSStackView(views: editButtons); toolRow.orientation = .horizontal; toolRow.spacing = 4; toolRow.alignment = .centerY
+        let outputRow = NSStackView(views: outputButtons); outputRow.orientation = .horizontal; outputRow.spacing = 4; outputRow.alignment = .centerY
         let toolbar = NSVisualEffectView(frame: .zero); toolbar.material = .hudWindow; toolbar.state = .active; toolbar.wantsLayer = true; toolbar.layer?.cornerRadius = 10
         let content = NSStackView(views: [toolRow, outputRow])
-        content.spacing = 7; content.alignment = .centerY
+        content.spacing = 4; content.alignment = .centerY
         let twoLines = CaptureOverlayLayout.toolbarUsesTwoLines(fixedWidth: toolRow.fittingSize.width + outputRow.fittingSize.width + 7 + 20, visibleWidth: targetScreen.visibleFrame.width)
         content.orientation = twoLines ? .vertical : .horizontal
         toolbar.addSubview(content)
@@ -527,7 +563,8 @@ final class SelectionView: NSView {
         toolbar.layoutSubtreeIfNeeded()
         updateStyleControls(for: .select)
         toolbar.layoutSubtreeIfNeeded()
-        toolbarFixedSize = toolbar.fittingSize
+        let visible = targetScreen.visibleFrame.offsetBy(dx: -targetScreen.frame.minX, dy: -targetScreen.frame.minY)
+        toolbarFixedSize = CaptureOverlayLayout.toolbarSize(toolbar.fittingSize, visibleFrame: visible)
         toolbarFixedSize.height = twoLines ? 80 : 40
         addSubview(toolbar); self.toolbar = toolbar
         positionToolbar()
@@ -574,6 +611,7 @@ final class SelectionView: NSView {
         positionOptionsPanel()
         panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(optionsControls.first)
+        AccessibilityAnnouncements.post("样式，颜色和粗细", on: panel)
         installOptionsMonitors()
     }
 
@@ -860,6 +898,10 @@ final class SelectionView: NSView {
         updateMemoryLabel(for: tool)
         updateSizeValue(value, for: tool)
         updateStyleButton()
+        let now = Date.now
+        guard AccessibilityAnnouncements.shouldPost(lastAnnouncementAt: lastStyleAnnouncementAt, now: now) else { return }
+        lastStyleAnnouncementAt = now
+        AccessibilityAnnouncements.post("\(tool.styleLabel) \(Int(value)) \(tool.styleRange.unit == "pt" ? "点" : "像素")", on: sender)
     }
 
     private func commitBrushSize() {
@@ -1013,9 +1055,8 @@ final class SelectionView: NSView {
         guard let toolbar else { return }
         if toolbarFixedSize.width > 0 { toolbar.frame.size = toolbarFixedSize }
         else { toolbar.frame.size = toolbar.fittingSize }
-        let below = selection.minY - toolbar.frame.height - 10
-        let y = below >= 8 ? below : min(bounds.maxY - toolbar.frame.height - 8, selection.maxY + 10)
-        toolbar.frame.origin = CGPoint(x: min(max(8, selection.midX - toolbar.frame.width / 2), bounds.maxX - toolbar.frame.width - 8), y: y)
+        let visible = targetScreen.visibleFrame.offsetBy(dx: -targetScreen.frame.minX, dy: -targetScreen.frame.minY)
+        toolbar.frame = CaptureOverlayLayout.toolbarFrame(size: toolbar.frame.size, selection: selection, visibleFrame: visible)
         positionOptionsPanel()
     }
 

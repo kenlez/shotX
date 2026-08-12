@@ -16,6 +16,7 @@
 | FR-CAP-10 | region selection geometry ↔ frozen CGImage pixel space unified in `AnnotationView.cgPixelRect`/`clampedCrop` and `render()`; upright crop instead of `draw(in:from:)` coordinate guessing; mosaic samples CG pixel rect | `testRegionPixelRectMapsYUpSelectionToCGTopLeft`, `testRegionRenderIsNotFlippedOrMirrored`; release build | B+M |
 | FR-CAP-11/12 | fixed-size toolbar (`toolbarFixedSize`); color button opens floating `NSPanel` below toolbar with preset swatches + eyedropper that samples the frozen screen CGImage pixels (no overlay interception), anchored at cursor | release build; build passes; interaction is user-verified | B+M |
 | FR-CAP-13 | `SelectionView` double-click / Space = `quickCopy` (copy+exit); Space in region-recording selection = `onQuickRecord` → `RecordingCoordinator.startImmediately`; Return keeps settings flow | release build; interaction is user-verified | B+M |
+| FR-CAP-14/15/16 | fixed element set toolbar (7 tools + undo/redo + fixed 84 pt "样式" button + copy/save/share/pin/close), `toolbarFixedSize` computed once, `updateStyleControls` only updates the "样式" summary and options panel (no inline hide/show); options panel = 300 pt `NSPanel` (`OptionsPanel`, key-capable) anchored below toolbar with down→up→edge avoidance, containing memory echo + 12 preset swatches w/ accent+checkmark selected state + eyedropper + `BrushSlider` (continuous 1–8/11–32/8–40) with preset buttons; drag live-applies (`applyStyleLive`, no history pollution), `mouseUp`/preset/keyboard commit to `annotationSizes` and persist | `testToolStyleRangesMatchFRCAP16`; release build; interaction is user-verified | B+M |
 | FR-LONG-01/02 | `ScrollingCaptureCoordinator.swift` overlap matching and live preview | release build; fixture corpus remains user validation | M |
 | FR-LONG-03/04 | match/fast/horizontal pause, undo and frozen limits | `testFrozenDiskAndLongCaptureThresholds` | B+M |
 | FR-REC-01 | `CaptureCoordinator` selection; `ScreenRecorder` excludes ShotX application | release build; hardware case remains user validation | M |
@@ -46,3 +47,12 @@ QA 复测闭环（BRA-48，2026-08-12）：
 - 静默冒烟启动 → 进程启动后存活、退出干净
 - 静态检查 → 无网络代码；无摄像头捕获残留（AVCaptureDevice/Session 仅限音频媒体类型，`mediaType: .audio`）
 - 桌面交互（选区拖动/缩放、原始尺寸实时刷新、开始后锁定、Esc 返回）归用户手测，由 `QA-MANUAL-TEST-CHECKLIST-BRA-45.md` 8 条 TC 覆盖，本机不执行桌面操控
+
+后台自测闭环（本次 BRA-54 交付运行结果）：
+
+- `swift test`（clean）→ 30/30 通过，0 failures（新增 `testToolStyleRangesMatchFRCAP16`，覆盖 FR-CAP-16 各工具拖拽范围/离散档位/默认值）
+- `make app` → release 构建成功；仅剩 1 条 BRA-48 已记录的并发警告（`menuTracking`），无新增编译告警
+- `codesign --verify --deep --strict --verbose=2 ShotX.app` → valid on disk，satisfies its Designated Requirement
+- 静默冒烟启动 → 进程启动后存活、退出干净
+- 静态检查 → 无网络代码；无摄像头捕获残留
+- 桌面交互（固定元素集、工具选项浮层展开/避让/关闭、可拖拽笔刷大小实时生效与记忆、VoiceOver/键盘可达）归用户手测，随 `ShotX.app.zip` + 手测清单交付

@@ -54,6 +54,78 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(decoded.annotationSizes[AnnotationTool.mosaic.rawValue], 40)
     }
 
+    @MainActor
+    func testLiveAnnotationStyleDrivesNextStrokeAndRestores() throws {
+        let image = CGImage(width: 10, height: 10, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 40, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue), provider: CGDataProvider(data: Data(repeating: 255, count: 400) as CFData)!, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+        let view = AnnotationView(image: image, settings: .defaults)
+        view.tool = .pen
+        view.applyStyleLive(color: .systemBlue, size: 7)
+        let down = NSEvent.mouseEvent(with: .leftMouseDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        let up = NSEvent.mouseEvent(with: .leftMouseUp, location: CGPoint(x: 5, y: 5), modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
+        view.mouseDown(with: down); view.mouseUp(with: up)
+        guard case .line(_, _, _, _, let size)? = view.stateSnapshot.annotations.last else { return XCTFail("Expected stroke") }
+        XCTAssertEqual(size, 7)
+
+        var settings = AppSettings.defaults
+        settings.annotationSizes[AnnotationTool.pen.rawValue] = 7
+        let reopened = AnnotationView(image: image, settings: try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings)))
+        XCTAssertEqual(reopened.styleSize(for: .pen), 7)
+    }
+
+    func testToolStyleRangesMatchFRCAP16() {
+        XCTAssertEqual(AnnotationTool.arrow.styleRange.min, 1)
+        XCTAssertEqual(AnnotationTool.arrow.styleRange.max, 8)
+        XCTAssertEqual(AnnotationTool.arrow.styleRange.presets, [1, 2, 4, 8])
+        XCTAssertEqual(AnnotationTool.rectangle.styleRange.presets, [1, 2, 4, 8])
+        XCTAssertEqual(AnnotationTool.pen.styleRange.presets, [1, 2, 4, 8])
+        XCTAssertEqual(AnnotationTool.text.styleRange.min, 11)
+        XCTAssertEqual(AnnotationTool.text.styleRange.max, 32)
+        XCTAssertEqual(AnnotationTool.text.styleRange.presets, [11, 13, 16, 24, 32])
+        XCTAssertEqual(AnnotationTool.mosaic.styleRange.min, 8)
+        XCTAssertEqual(AnnotationTool.mosaic.styleRange.max, 40)
+        XCTAssertEqual(AnnotationTool.mosaic.styleRange.presets, [8, 16, 24, 40])
+        XCTAssertEqual(AnnotationTool.mosaic.styleRange.unit, "px")
+        XCTAssertEqual(AnnotationTool.text.styleRange.unit, "pt")
+        XCTAssertEqual(AnnotationTool.defaultSize(for: .arrow), 2)
+        XCTAssertEqual(AnnotationTool.defaultSize(for: .pen), 2)
+        XCTAssertEqual(AnnotationTool.defaultSize(for: .text), 16)
+        XCTAssertEqual(AnnotationTool.defaultSize(for: .mosaic), 16)
+        XCTAssertEqual(AnnotationTool.styledCases.count, 5)
+    }
+
+    func testAnnotationStyleAccessibilityValuesIncludeUnits() {
+        XCTAssertEqual(AnnotationTool.pen.styleAccessibilityLabel, "粗细（pt）")
+        XCTAssertEqual(AnnotationTool.pen.styleAccessibilityValue(2), "2 pt")
+        XCTAssertEqual(AnnotationTool.mosaic.styleAccessibilityLabel, "笔刷大小（px）")
+        XCTAssertEqual(AnnotationTool.mosaic.styleAccessibilityValue(16), "16 px")
+    }
+
+    @MainActor
+    func testAccessibilityAnnouncementThrottle() {
+        let start = Date(timeIntervalSinceReferenceDate: 0)
+        XCTAssertTrue(AccessibilityAnnouncements.shouldPost(lastAnnouncementAt: nil, now: start))
+        XCTAssertFalse(AccessibilityAnnouncements.shouldPost(lastAnnouncementAt: start, now: start.addingTimeInterval(0.49)))
+        XCTAssertTrue(AccessibilityAnnouncements.shouldPost(lastAnnouncementAt: start, now: start.addingTimeInterval(0.5)))
+        AccessibilityAnnouncements.post("样式，颜色和粗细", on: NSView())
+    }
+
+    func testCaptureOverlayLayoutStaysInsideNarrowAndShortVisibleFrames() {
+        XCTAssertTrue(CaptureOverlayLayout.toolbarUsesTwoLines(fixedWidth: 620, visibleWidth: 500))
+        XCTAssertFalse(CaptureOverlayLayout.toolbarUsesTwoLines(fixedWidth: 400, visibleWidth: 500))
+
+        let narrowVisible = CGRect(x: 0, y: 0, width: 500, height: 300)
+        let toolbar = CaptureOverlayLayout.toolbarFrame(size: CGSize(width: 546, height: 80), selection: CGRect(x: 420, y: 20, width: 60, height: 40), visibleFrame: narrowVisible)
+        XCTAssertTrue(narrowVisible.insetBy(dx: 8, dy: 8).contains(toolbar))
+
+        let visible = CGRect(x: 20, y: 30, width: 320, height: 150)
+        let size = CaptureOverlayLayout.optionsPanelSize(contentHeight: 480, visibleFrame: visible)
+        XCTAssertEqual(size.width, 300)
+        XCTAssertEqual(size.height, 134)
+
+        let frame = CaptureOverlayLayout.optionsPanelFrame(contentHeight: 480, visibleFrame: visible, toolbarFrame: CGRect(x: 280, y: 35, width: 40, height: 40))
+        XCTAssertTrue(visible.insetBy(dx: 8, dy: 8).contains(frame))
+    }
+
     func testVideoTrimFractionsRemainOrderedAndBounded() {
         XCTAssertEqual(VideoExporter.fractions(start: -1, end: 2).0, 0)
         XCTAssertEqual(VideoExporter.fractions(start: -1, end: 2).1, 1)
