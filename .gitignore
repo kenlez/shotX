@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Build artifacts
+.build/
+ShotX.app/
+
+# Local tooling / runtime
+.opencode/
+.multica/
+.agent_context/
+node_modules/
+
+# Editor
+*.swp
+*.swo
