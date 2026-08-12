@@ -1144,11 +1144,10 @@ private final class OptionsPanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
-private final class BrushSlider: NSSlider {
+final class BrushSlider: NSSlider {
     var onBegin: (() -> Void)?
     var onCommit: (() -> Void)?
-    override func mouseDown(with event: NSEvent) { onBegin?(); super.mouseDown(with: event) }
-    override func mouseUp(with event: NSEvent) { super.mouseUp(with: event); onCommit?() }
+    override func mouseDown(with event: NSEvent) { onBegin?(); super.mouseDown(with: event); onCommit?() }
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 123 || event.keyCode == 124 {
             let step = event.modifierFlags.contains(.shift) ? 5.0 : 1.0
