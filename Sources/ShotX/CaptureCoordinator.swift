@@ -3,6 +3,29 @@ import Carbon.HIToolbox
 import CoreGraphics
 import ScreenCaptureKit
 
+enum CaptureOverlayLayout {
+    static let edgeInset: CGFloat = 8
+    static let optionsWidth: CGFloat = 300
+
+    static func toolbarUsesTwoLines(fixedWidth: CGFloat, visibleWidth: CGFloat) -> Bool {
+        fixedWidth + edgeInset * 2 > visibleWidth
+    }
+
+    static func optionsPanelSize(contentHeight: CGFloat, visibleFrame: CGRect) -> CGSize {
+        CGSize(width: optionsWidth, height: min(max(120, contentHeight), max(1, visibleFrame.height - edgeInset * 2)))
+    }
+
+    static func optionsPanelFrame(contentHeight: CGFloat, visibleFrame: CGRect, toolbarFrame: CGRect) -> CGRect {
+        let size = optionsPanelSize(contentHeight: contentHeight, visibleFrame: visibleFrame)
+        let bounds = visibleFrame.insetBy(dx: edgeInset, dy: edgeInset)
+        var origin = CGPoint(x: toolbarFrame.minX, y: toolbarFrame.minY - size.height - 6)
+        if origin.y < bounds.minY { origin.y = toolbarFrame.maxY + 6 }
+        origin.x = min(max(bounds.minX, origin.x), max(bounds.minX, bounds.maxX - size.width))
+        origin.y = min(max(bounds.minY, origin.y), max(bounds.minY, bounds.maxY - size.height))
+        return CGRect(origin: origin, size: size)
+    }
+}
+
 @MainActor
 final class CaptureCoordinator {
     static let shared = CaptureCoordinator()
@@ -244,9 +267,17 @@ final class SelectionView: NSView {
     private var toolbar: NSVisualEffectView?
     private var toolControl: NSSegmentedControl?
     private var toolbarFixedSize = NSSize.zero
-    private let colorButton = NSButton(frame: NSRect(x: 0, y: 0, width: 40, height: 26))
-    private let sizePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private var colorPanel: NSPanel?
+    private var optionsContentHeight: CGFloat = 120
+    private var lastToolIndex = 0
+    private let styleButton = NSButton(frame: .zero)
+    private var optionsPanel: NSPanel?
+    private var optionsMonitor: Any?
+    private var optionsKeyMonitor: Any?
+    private var memoryLabel: NSTextField?
+    private var swatchButtons: [NSButton] = []
+    private var brushSlider: BrushSlider?
+    private var sizeValueLabel: NSTextField?
+    private var optionsControls: [NSView] = []
     private var eyedropperMonitor: Any?
     private var eyedropperClickMonitor: Any?
     private var eyedropperKeyMonitor: Any?
@@ -297,8 +328,8 @@ final class SelectionView: NSView {
                 stopEyeDropper()
                 return
             }
-            if colorPanel?.isVisible == true {
-                hideColorPanel()
+            if optionsPanel?.isVisible == true {
+                hideOptionsPanel()
                 return
             }
             phase.discard(); onCancel?()
@@ -456,7 +487,7 @@ final class SelectionView: NSView {
         editor.onEscape = { [weak self] in
             guard let self else { return }
             if self.eyedropperWindow != nil { self.stopEyeDropper(); return }
-            if self.colorPanel?.isVisible == true { self.hideColorPanel(); return }
+            if self.optionsPanel?.isVisible == true { self.hideOptionsPanel(); return }
             self.phase.discard(); self.onCancel?()
         }
         editor.onUndo = { [weak self] in self?.undo() }
@@ -479,109 +510,239 @@ final class SelectionView: NSView {
         let tools = NSSegmentedControl(labels: AnnotationTool.allCases.map(\.rawValue), trackingMode: .selectOne, target: self, action: #selector(toolChanged(_:)))
         tools.selectedSegment = 0
         toolControl = tools
-        colorButton.target = self; colorButton.action = #selector(colorPressed); colorButton.setAccessibilityLabel("标注颜色"); colorButton.toolTip = "标注颜色"
-        sizePopup.target = self; sizePopup.action = #selector(styleChanged); sizePopup.setAccessibilityLabel("标注粗细或字号")
-        let stack = NSStackView(views: [tools, colorButton, sizePopup, button("撤销", #selector(undoPressed)), button("重做", #selector(redoPressed)), button("分享…", #selector(sharePressed)), button("保存…", #selector(savePressed)), button("贴图", #selector(pinPressed)), button("复制", #selector(copyPressed))])
-        stack.orientation = .horizontal; stack.spacing = 7; stack.alignment = .centerY
-        let toolbar = NSVisualEffectView(frame: .zero); toolbar.material = .hudWindow; toolbar.state = .active; toolbar.wantsLayer = true; toolbar.layer?.cornerRadius = 10; toolbar.addSubview(stack)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 10), stack.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -10), stack.topAnchor.constraint(equalTo: toolbar.topAnchor, constant: 7), stack.bottomAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: -7)])
+        styleButton.target = self; styleButton.action = #selector(stylePressed); styleButton.setAccessibilityLabel("样式"); styleButton.toolTip = "样式"
+        styleButton.widthAnchor.constraint(equalToConstant: 84).isActive = true
+        let editButtons = [tools, button("撤销", #selector(undoPressed)), button("重做", #selector(redoPressed)), styleButton]
+        let outputButtons = [button("复制", #selector(copyPressed)), button("保存…", #selector(savePressed)), button("分享…", #selector(sharePressed)), button("贴图", #selector(pinPressed)), button("关闭", #selector(closePressed))]
+        let toolRow = NSStackView(views: editButtons); toolRow.orientation = .horizontal; toolRow.spacing = 7; toolRow.alignment = .centerY
+        let outputRow = NSStackView(views: outputButtons); outputRow.orientation = .horizontal; outputRow.spacing = 7; outputRow.alignment = .centerY
+        let toolbar = NSVisualEffectView(frame: .zero); toolbar.material = .hudWindow; toolbar.state = .active; toolbar.wantsLayer = true; toolbar.layer?.cornerRadius = 10
+        let content = NSStackView(views: [toolRow, outputRow])
+        content.spacing = 7; content.alignment = .centerY
+        let twoLines = CaptureOverlayLayout.toolbarUsesTwoLines(fixedWidth: toolRow.fittingSize.width + outputRow.fittingSize.width + 7 + 20, visibleWidth: targetScreen.visibleFrame.width)
+        content.orientation = twoLines ? .vertical : .horizontal
+        toolbar.addSubview(content)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([content.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 10), content.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -10), content.topAnchor.constraint(equalTo: toolbar.topAnchor, constant: 4), content.bottomAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: -4)])
         toolbar.layoutSubtreeIfNeeded()
         updateStyleControls(for: .select)
         toolbar.layoutSubtreeIfNeeded()
         toolbarFixedSize = toolbar.fittingSize
+        toolbarFixedSize.height = twoLines ? 80 : 40
         addSubview(toolbar); self.toolbar = toolbar
         positionToolbar()
     }
 
     private func button(_ title: String, _ action: Selector) -> NSButton { NSButton(title: title, target: self, action: action) }
-    @objc private func toolChanged(_ sender: NSSegmentedControl) { let tool = AnnotationTool.allCases[sender.selectedSegment]; editor?.tool = tool; updateStyleControls(for: tool); window?.makeFirstResponder(editor) }
 
-    @objc private func colorPressed() {
-        if colorPanel?.isVisible == true {
-            hideColorPanel()
-        } else {
-            showColorPanel()
+    @objc private func toolChanged(_ sender: NSSegmentedControl) {
+        let index = sender.selectedSegment
+        let tool = AnnotationTool.allCases[index]
+        if index == lastToolIndex, AnnotationTool.styledCases.contains(tool), optionsPanel?.isVisible == true {
+            hideOptionsPanel()
+            return
         }
+        lastToolIndex = index
+        editor?.tool = tool
+        updateStyleControls(for: tool)
+        if AnnotationTool.styledCases.contains(tool) {
+            if optionsPanel?.isVisible == true { rebuildOptionsPanel() } else { showOptionsPanel() }
+        } else {
+            hideOptionsPanel()
+        }
+        if optionsPanel?.isVisible != true { window?.makeFirstResponder(editor) }
     }
 
-    private func showColorPanel() {
-        guard let window else { return }
-        hideColorPanel()
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 296, height: 108), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+    @objc private func stylePressed() {
+        guard let editor, AnnotationTool.styledCases.contains(editor.tool) else { return }
+        if optionsPanel?.isVisible == true { hideOptionsPanel() } else { showOptionsPanel() }
+    }
+
+    private func showOptionsPanel() {
+        hideOptionsPanel()
+        let panel = OptionsPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 220), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
         panel.level = .screenSaver
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        panel.contentView = makeColorPanelContent()
-        colorPanel = panel
-        positionColorPanel()
-        panel.orderFrontRegardless()
+        let content = makeOptionsContent()
+        panel.contentView = content
+        panel.setContentSize(CaptureOverlayLayout.optionsPanelSize(contentHeight: optionsContentHeight, visibleFrame: targetScreen.visibleFrame))
+        optionsPanel = panel
+        positionOptionsPanel()
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(optionsControls.first)
+        installOptionsMonitors()
     }
 
-    private func hideColorPanel() {
-        colorPanel?.orderOut(nil)
-        colorPanel = nil
+    private func rebuildOptionsPanel() {
+        guard let panel = optionsPanel else { return }
+        let content = makeOptionsContent()
+        panel.contentView = content
+        panel.setContentSize(CaptureOverlayLayout.optionsPanelSize(contentHeight: optionsContentHeight, visibleFrame: targetScreen.visibleFrame))
+        positionOptionsPanel()
     }
 
-    private func makeColorPanelContent() -> NSView {
-        let content = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 296, height: 108))
+    private func hideOptionsPanel() {
+        if let monitor = optionsMonitor { NSEvent.removeMonitor(monitor) }
+        optionsMonitor = nil
+        if let monitor = optionsKeyMonitor { NSEvent.removeMonitor(monitor) }
+        optionsKeyMonitor = nil
+        optionsPanel?.orderOut(nil)
+        optionsPanel = nil
+        window?.makeKey()
+        window?.makeFirstResponder(styleButton)
+    }
+
+    private func installOptionsMonitors() {
+        optionsMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            guard let self, let panel = self.optionsPanel, panel.isVisible else { return event }
+            let point = event.window?.convertToScreen(NSRect(origin: event.locationInWindow, size: .zero)).origin ?? NSEvent.mouseLocation
+            if panel.frame.contains(point) { return event }
+            if self.toolbar.map({ self.window?.convertToScreen($0.convert($0.bounds, to: nil)) ?? .zero })?.contains(point) == true { return event }
+            self.hideOptionsPanel()
+            return event
+        }
+        optionsKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.keyCode == 53, self.optionsPanel?.isVisible == true else { return event }
+            self.hideOptionsPanel()
+            return nil
+        }
+    }
+
+    private func makeOptionsContent() -> NSView {
+        guard let tool = editor?.tool else { return NSView() }
+        optionsControls = []
+        let content = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 300, height: 220))
         content.material = .hudWindow; content.state = .active; content.wantsLayer = true; content.layer?.cornerRadius = 10
-        let presets: [NSColor] = ["#FF3B30", "#FF9500", "#FFCC00", "#34C759", "#5AC8FA", "#007AFF", "#AF52DE", "#FF2D55", "#A2845E", "#8E8E93", "#FFFFFF", "#000000"].compactMap { NSColor(hex: $0) }
+        var sections: [NSView] = [makeMemoryRow(for: tool)]
+        if tool != .mosaic { sections.append(makeColorSection()) }
+        sections.append(makeSizeSection(for: tool))
+        let root = NSStackView(views: sections)
+        root.orientation = .vertical; root.spacing = 8; root.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
+        root.layoutSubtreeIfNeeded()
+        root.frame = NSRect(origin: .zero, size: NSSize(width: CaptureOverlayLayout.optionsWidth - 20, height: root.fittingSize.height))
+        optionsContentHeight = root.frame.height + 20
+        let scroll = NSScrollView()
+        scroll.documentView = root; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(scroll)
+        NSLayoutConstraint.activate([scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10), scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10), scroll.topAnchor.constraint(equalTo: content.topAnchor, constant: 10), scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10)])
+        for (index, control) in optionsControls.enumerated() {
+            control.nextKeyView = optionsControls[(index + 1) % optionsControls.count]
+        }
+        return content
+    }
+
+    private func makeMemoryRow(for tool: AnnotationTool) -> NSView {
+        let label = NSTextField(labelWithString: "")
+        label.font = .systemFont(ofSize: 13, weight: .semibold)
+        label.setAccessibilityLabel("当前工具样式")
+        memoryLabel = label
+        updateMemoryLabel(for: tool)
+        return label
+    }
+
+    private func updateMemoryLabel(for tool: AnnotationTool) {
+        let size = currentSize(for: tool)
+        let text = tool == .mosaic ? "马赛克 · \(Int(size)) px" : "\(tool.rawValue) · 颜色 \(currentAnnotationColor.hex) · \(Int(size)) \(tool.styleRange.unit)"
+        memoryLabel?.stringValue = text
+    }
+
+    private func makeColorSection() -> NSView {
         var swatches: [NSButton] = []
-        for (index, color) in presets.enumerated() {
+        for (index, color) in Self.presetColors.enumerated() {
             let b = NSButton(title: "", target: self, action: #selector(presetPicked(_:)))
             b.setButtonType(.momentaryChange)
             b.bezelStyle = .regularSquare
-            b.image = Self.swatchImage(color, size: NSSize(width: 20, height: 16))
+            let selected = color.hex == currentAnnotationColor.hex
+            b.image = Self.swatchImage(color, size: NSSize(width: 20, height: 16), selected: selected)
             b.imagePosition = .imageOnly
             b.tag = index
-            b.setAccessibilityLabel("预设颜色 \(color.hex)")
+            b.setAccessibilityLabel("预设颜色 \(color.hex)\(selected ? "，已选中" : "")")
+            b.setAccessibilityValue(selected ? "已选中" : "未选中")
+            b.toolTip = color.hex
             swatches.append(b)
         }
+        swatchButtons = swatches
+        optionsControls.append(contentsOf: swatches)
         let row1 = NSStackView(views: Array(swatches[0..<6])); row1.orientation = .horizontal; row1.spacing = 6; row1.alignment = .centerY
         let row2 = NSStackView(views: Array(swatches[6..<12])); row2.orientation = .horizontal; row2.spacing = 6; row2.alignment = .centerY
         let grid = NSStackView(views: [row1, row2]); grid.orientation = .vertical; grid.spacing = 6
         let eyedrop = NSButton(title: "取色器", target: self, action: #selector(eyedropperPressed))
         eyedrop.bezelStyle = .rounded
         eyedrop.setAccessibilityLabel("从屏幕取色")
+        optionsControls.append(eyedrop)
         let bottom = NSStackView(views: [eyedrop, NSView()])
         bottom.orientation = .horizontal; bottom.spacing = 8
         let root = NSStackView(views: [grid, bottom])
-        root.orientation = .vertical; root.spacing = 10; root.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
-        root.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(root)
-        NSLayoutConstraint.activate([root.leadingAnchor.constraint(equalTo: content.leadingAnchor), root.trailingAnchor.constraint(equalTo: content.trailingAnchor), root.topAnchor.constraint(equalTo: content.topAnchor), root.bottomAnchor.constraint(equalTo: content.bottomAnchor)])
-        return content
+        root.orientation = .vertical; root.spacing = 8
+        return root
+    }
+
+    private func makeSizeSection(for tool: AnnotationTool) -> NSView {
+        let range = tool.styleRange
+        let current = currentSize(for: tool)
+        let slider = BrushSlider(value: current, minValue: range.min, maxValue: range.max, target: self, action: #selector(brushChanged(_:)))
+        slider.isContinuous = true
+        slider.onBegin = { [weak self] in self?.remember() }
+        slider.onCommit = { [weak self] in self?.commitBrushSize() }
+        slider.setAccessibilityLabel(tool.styleAccessibilityLabel)
+        slider.setAccessibilityValue(tool.styleAccessibilityValue(current))
+        brushSlider = slider
+        optionsControls.append(slider)
+        let valueLabel = NSTextField(labelWithString: "\(Int(current)) \(range.unit)")
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        valueLabel.setAccessibilityLabel("当前值")
+        sizeValueLabel = valueLabel
+        let title = NSTextField(labelWithString: tool.styleLabel)
+        title.font = .systemFont(ofSize: 12, weight: .semibold)
+        let sliderRow = NSStackView(views: [title, slider, valueLabel])
+        sliderRow.orientation = .horizontal; sliderRow.spacing = 8; sliderRow.alignment = .centerY
+        let presets = range.presets.map { value -> NSButton in
+            let b = NSButton(title: "\(Int(value))", target: self, action: #selector(sizePresetPressed(_:)))
+            b.bezelStyle = .rounded
+            b.tag = Int(value)
+            b.setAccessibilityLabel("\(tool.styleLabel) \(Int(value)) \(range.unit)")
+            b.toolTip = "\(Int(value)) \(range.unit)"
+            return b
+        }
+        optionsControls.append(contentsOf: presets)
+        let presetRow = NSStackView(views: presets + [NSView()])
+        presetRow.orientation = .horizontal; presetRow.spacing = 6; presetRow.alignment = .centerY
+        let root = NSStackView(views: [sliderRow, presetRow])
+        root.orientation = .vertical; root.spacing = 6
+        return root
     }
 
     @objc private func presetPicked(_ sender: NSButton) {
-        let presets: [NSColor] = ["#FF3B30", "#FF9500", "#FFCC00", "#34C759", "#5AC8FA", "#007AFF", "#AF52DE", "#FF2D55", "#A2845E", "#8E8E93", "#FFFFFF", "#000000"].compactMap { NSColor(hex: $0) }
-        guard sender.tag >= 0, sender.tag < presets.count else { return }
-        applyPickedColor(presets[sender.tag])
+        guard sender.tag >= 0, sender.tag < Self.presetColors.count else { return }
+        applyPickedColor(Self.presetColors[sender.tag])
     }
 
     private func applyPickedColor(_ color: NSColor) {
         guard let editor, let model else { return }
         let tool = editor.tool
-        let size = Double(sizePopup.titleOfSelectedItem ?? "2") ?? 2
+        let size = currentSize(for: tool)
         editor.applyStyle(color: color, size: size)
         model.settings.annotationColors[tool.rawValue] = color.hex
         model.settings.annotationSizes[tool.rawValue] = size
         model.persist()
         currentAnnotationColor = color
-        updateColorButton()
+        updateColorButtons()
+        updateMemoryLabel(for: tool)
+        updateStyleButton()
     }
 
     @objc private func eyedropperPressed() {
-        hideColorPanel()
+        hideOptionsPanel()
         startEyeDropper()
     }
 
     private func startEyeDropper() {
-        guard let window, frozenCG != nil else { return }
+        guard window != nil, frozenCG != nil else { return }
         NSCursor.crosshair.push()
         let size = NSSize(width: 168, height: 168)
         let origin = CGPoint(x: NSEvent.mouseLocation.x, y: NSEvent.mouseLocation.y + size.height)
@@ -691,16 +852,48 @@ final class SelectionView: NSView {
         return NSColor(calibratedRed: red, green: green, blue: blue, alpha: 1)
     }
 
-    @objc private func styleChanged() {
+    @objc private func brushChanged(_ sender: BrushSlider) {
+        guard let editor else { return }
+        let tool = editor.tool
+        let value = sender.doubleValue
+        editor.applyStyleLive(color: currentAnnotationColor, size: value)
+        updateMemoryLabel(for: tool)
+        updateSizeValue(value, for: tool)
+        updateStyleButton()
+    }
+
+    private func commitBrushSize() {
+        guard let model, let slider = brushSlider else { return }
+        let tool = editor?.tool ?? .pen
+        let value = slider.doubleValue
+        model.settings.annotationSizes[tool.rawValue] = value
+        model.persist()
+        updateMemoryLabel(for: tool)
+        updateSizeValue(value, for: tool)
+        updateStyleButton()
+    }
+
+    @objc private func sizePresetPressed(_ sender: NSButton) {
         guard let editor, let model else { return }
-        let tool = editor.tool; let size = Double(sizePopup.titleOfSelectedItem ?? "2") ?? 2
-        editor.applyStyle(color: currentAnnotationColor, size: size)
-        model.settings.annotationColors[tool.rawValue] = currentAnnotationColor.hex; model.settings.annotationSizes[tool.rawValue] = size; model.persist()
+        let tool = editor.tool
+        let value = Double(sender.tag)
+        brushSlider?.doubleValue = value
+        editor.applyStyle(color: currentAnnotationColor, size: value)
+        model.settings.annotationSizes[tool.rawValue] = value
+        model.persist()
+        updateMemoryLabel(for: tool)
+        updateSizeValue(value, for: tool)
+        updateStyleButton()
+    }
+
+    @objc private func closePressed() {
+        hideOptionsPanel()
+        phase.discard(); onCancel?()
     }
     @objc private func undoPressed() { undo() }
     @objc private func redoPressed() { redo() }
     @objc private func copyPressed() {
-        guard let image = editor?.render() else { return }
+        guard let image = renderOutput() else { return }
         NSPasteboard.general.clearContents()
         if NSPasteboard.general.writeObjects([image]) { commit(image) } else { model?.showError("无法复制。结果仍保留，请重试或保存图片。") }
     }
@@ -714,7 +907,7 @@ final class SelectionView: NSView {
         onQuickRecord?(selection)
     }
     @objc private func savePressed() {
-        guard let image = editor?.render(), let data = image.pngData, let window else { return }
+        guard let image = renderOutput(), let data = image.pngData, let window else { return }
         let panel = NSSavePanel(); panel.allowedContentTypes = [.png]; panel.nameFieldStringValue = "ShotX-\(Self.timestamp()).png"
         if let path = model?.settings.lastSaveDirectory { panel.directoryURL = URL(fileURLWithPath: path) }
         panel.beginSheetModal(for: window) { [weak self] response in
@@ -724,31 +917,76 @@ final class SelectionView: NSView {
         }
     }
     @objc private func sharePressed() {
-        guard let image = editor?.render(), let toolbar else { return }
+        guard let image = renderOutput(), let toolbar else { return }
         pendingShareImage = image
         let picker = NSSharingServicePicker(items: [image]); picker.delegate = self; picker.show(relativeTo: toolbar.bounds, of: toolbar, preferredEdge: .minY)
     }
-    @objc private func pinPressed() { guard let image = editor?.render() else { return }; PinWindowController.show(image); commit(image) }
+    @objc private func pinPressed() { guard let image = renderOutput() else { return }; PinWindowController.show(image); commit(image) }
+    private func renderOutput() -> NSImage? { hideOptionsPanel(); return editor?.render() }
     private func commit(_ image: NSImage) { phase.commit(); onCommit?(image) }
 
     private func updateStyleControls(for tool: AnnotationTool) {
-        let styled = AnnotationTool.styledCases.contains(tool); colorButton.isHidden = !styled || tool == .mosaic; sizePopup.isHidden = !styled
         currentAnnotationColor = NSColor(hex: model?.settings.annotationColors[tool.rawValue] ?? "#FF3B30") ?? .systemRed
-        updateColorButton()
-        let values: [Double] = tool == .text ? [11, 13, 16, 24, 32] : tool == .mosaic ? [8, 16, 24, 40] : [1, 2, 4, 8]
-        sizePopup.removeAllItems(); sizePopup.addItems(withTitles: values.map { String(Int($0)) }); sizePopup.selectItem(withTitle: String(Int(model?.settings.annotationSizes[tool.rawValue] ?? values.first ?? 2)))
+        updateStyleButton()
+        updateColorButtons()
+        updateMemoryLabel(for: tool)
     }
-    private func updateColorButton() {
-        colorButton.image = Self.swatchImage(currentAnnotationColor, size: NSSize(width: 22, height: 16))
-        colorButton.imagePosition = .imageOnly
-        colorButton.toolTip = "标注颜色 · \(currentAnnotationColor.hex)"
+    private func updateStyleButton() {
+        guard let tool = editor?.tool else { return }
+        let styled = AnnotationTool.styledCases.contains(tool)
+        styleButton.isEnabled = styled
+        if styled {
+            let size = currentSize(for: tool)
+            let summary = tool == .mosaic ? "\(Int(size)) px" : "\(Int(size)) pt"
+            styleButton.image = tool == .mosaic ? nil : Self.swatchImage(currentAnnotationColor, size: NSSize(width: 18, height: 13))
+            styleButton.imagePosition = tool == .mosaic ? .noImage : .imageLeading
+            styleButton.title = summary
+            styleButton.toolTip = "样式 · \(summary)"
+        } else {
+            styleButton.image = nil
+            styleButton.imagePosition = .noImage
+            styleButton.title = "样式"
+            styleButton.toolTip = "该工具无样式选项"
+        }
+        styleButton.setAccessibilityLabel("样式 \(styleButton.title)")
     }
-    private static func swatchImage(_ color: NSColor, size: NSSize) -> NSImage {
+    private func updateColorButtons() {
+        for (index, button) in swatchButtons.enumerated() where index < Self.presetColors.count {
+            let color = Self.presetColors[index]
+            let selected = color.hex == currentAnnotationColor.hex
+            button.image = Self.swatchImage(color, size: NSSize(width: 20, height: 16), selected: selected)
+            button.setAccessibilityLabel("预设颜色 \(color.hex)\(selected ? "，已选中" : "")")
+            button.setAccessibilityValue(selected ? "已选中" : "未选中")
+        }
+    }
+    private func updateSizeValue(_ value: Double, for tool: AnnotationTool) {
+        let accessibilityValue = tool.styleAccessibilityValue(value)
+        sizeValueLabel?.stringValue = accessibilityValue
+        brushSlider?.setAccessibilityLabel(tool.styleAccessibilityLabel)
+        brushSlider?.setAccessibilityValue(accessibilityValue)
+    }
+    private func currentSize(for tool: AnnotationTool) -> Double {
+        let range = tool.styleRange
+        let raw = editor?.styleSize(for: tool) ?? model?.settings.annotationSizes[tool.rawValue] ?? AnnotationTool.defaultSize(for: tool)
+        return min(max(range.min, raw), max(range.min, range.max))
+    }
+    private static let presetColors: [NSColor] = ["#FF3B30", "#FF9500", "#FFCC00", "#34C759", "#5AC8FA", "#007AFF", "#AF52DE", "#FF2D55", "#A2845E", "#8E8E93", "#FFFFFF", "#000000"].compactMap { NSColor(hex: $0) }
+    private static func swatchImage(_ color: NSColor, size: NSSize, selected: Bool = false) -> NSImage {
         let image = NSImage(size: size)
         image.lockFocus()
-        let path = NSBezierPath(roundedRect: NSRect(origin: .zero, size: size).insetBy(dx: 1, dy: 1), xRadius: 3, yRadius: 3)
+        let rect = NSRect(origin: .zero, size: size).insetBy(dx: 1, dy: 1)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3)
         color.setFill(); path.fill()
-        NSColor.white.withAlphaComponent(0.4).setStroke(); path.lineWidth = 1; path.stroke()
+        if selected {
+            NSColor.controlAccentColor.setStroke(); path.lineWidth = 2; path.stroke()
+            let check = NSBezierPath(); check.lineWidth = 1.5; check.lineCapStyle = .round
+            check.move(to: NSPoint(x: rect.minX + 4, y: rect.midY))
+            check.line(to: NSPoint(x: rect.midX, y: rect.minY + 3))
+            check.line(to: NSPoint(x: rect.maxX - 3, y: rect.maxY - 4))
+            NSColor.white.setStroke(); check.stroke()
+        } else {
+            NSColor.white.withAlphaComponent(0.4).setStroke(); path.lineWidth = 1; path.stroke()
+        }
         image.unlockFocus()
         return image
     }
@@ -778,15 +1016,14 @@ final class SelectionView: NSView {
         let below = selection.minY - toolbar.frame.height - 10
         let y = below >= 8 ? below : min(bounds.maxY - toolbar.frame.height - 8, selection.maxY + 10)
         toolbar.frame.origin = CGPoint(x: min(max(8, selection.midX - toolbar.frame.width / 2), bounds.maxX - toolbar.frame.width - 8), y: y)
-        positionColorPanel()
+        positionOptionsPanel()
     }
 
-    private func positionColorPanel() {
-        guard let colorPanel, let toolbar, let window else { return }
-        let panelSize = colorPanel.frame.size
-        let localOrigin = CGPoint(x: toolbar.frame.minX, y: toolbar.frame.minY - panelSize.height - 6)
-        let windowPoint = convert(localOrigin, to: nil)
-        colorPanel.setFrameOrigin(NSPoint(x: windowPoint.x, y: windowPoint.y))
+    private func positionOptionsPanel() {
+        guard let optionsPanel, let toolbar else { return }
+        let visible = targetScreen.visibleFrame
+        let toolbarScreen = window.map { $0.convertToScreen(toolbar.convert(toolbar.bounds, to: nil)) } ?? toolbar.frame
+        optionsPanel.setFrame(CaptureOverlayLayout.optionsPanelFrame(contentHeight: optionsContentHeight, visibleFrame: visible, toolbarFrame: toolbarScreen), display: false)
     }
 
     private func handle(at point: CGPoint) -> SelectionHandle? {
@@ -860,5 +1097,27 @@ extension SelectionView: NSSharingServicePickerDelegate {
     func sharingServicePicker(_ sharingServicePicker: NSSharingServicePicker, didChoose service: NSSharingService?) {
         guard service != nil, let image = pendingShareImage else { pendingShareImage = nil; return }
         pendingShareImage = nil; commit(image)
+    }
+}
+
+private final class OptionsPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
+private final class BrushSlider: NSSlider {
+    var onBegin: (() -> Void)?
+    var onCommit: (() -> Void)?
+    override func mouseDown(with event: NSEvent) { onBegin?(); super.mouseDown(with: event) }
+    override func mouseUp(with event: NSEvent) { super.mouseUp(with: event); onCommit?() }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 123 || event.keyCode == 124 {
+            let step = event.modifierFlags.contains(.shift) ? 5.0 : 1.0
+            onBegin?()
+            doubleValue = min(maxValue, max(minValue, doubleValue + (event.keyCode == 124 ? step : -step)))
+            sendAction(action, to: target)
+            onCommit?()
+            return
+        }
+        super.keyDown(with: event)
     }
 }
