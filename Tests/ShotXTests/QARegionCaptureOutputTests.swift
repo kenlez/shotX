@@ -3,6 +3,50 @@ import XCTest
 @testable import ShotX
 
 final class QARegionCaptureOutputTests: XCTestCase {
+    @MainActor func testCaptureFocusChainCyclesThroughSelectionHandlesToolbarOptionsAndOutputs() {
+        let selection = NSView()
+        let handles = (0..<8).map { _ in NSView() }
+        let toolbar = (0..<4).map { _ in NSView() }
+        let options = (0..<3).map { _ in NSView() }
+        let outputs = (0..<5).map { _ in NSView() }
+        let chain = CaptureFocusChain.views(selection: selection, handles: handles, toolbar: toolbar, options: options, outputs: outputs)
+
+        CaptureFocusChain.link(chain)
+
+        XCTAssertEqual(chain.count, 21)
+        for (index, view) in chain.enumerated() {
+            XCTAssertTrue(view.nextKeyView === chain[(index + 1) % chain.count])
+            XCTAssertTrue(view.previousKeyView === chain[(index + chain.count - 1) % chain.count])
+        }
+    }
+
+    @MainActor func testCaptureFocusChainWindowAwareBridgeSpansOverlayAndPanel() {
+        let selection = NSView()
+        let handles = (0..<8).map { _ in NSView() }
+        let toolbar = (0..<4).map { _ in NSView() }
+        let outputs = (0..<5).map { _ in NSView() }
+        let overlay = [selection] + handles + toolbar + outputs
+        let panel = (0..<3).map { _ in NSView() }
+
+        CaptureFocusChain.linkWindowAware(overlayViews: overlay, panelViews: panel)
+
+        XCTAssertEqual(overlay.count, 18)
+        for (index, view) in overlay.enumerated() where index < overlay.count - 1 {
+            XCTAssertTrue(view.nextKeyView === overlay[index + 1])
+        }
+        XCTAssertTrue(overlay.last?.nextKeyView === panel.first)
+        XCTAssertTrue(panel.last?.nextKeyView === overlay.first)
+        XCTAssertTrue(overlay.first?.previousKeyView === panel.last)
+        XCTAssertTrue(panel.first?.previousKeyView === overlay.last)
+    }
+
+    @MainActor func testCaptureFocusChainTinySelectionThresholdHidesToolbarAndPanel() {
+        XCTAssertTrue(CaptureFocusChain.isTiny(CGRect(x: 0, y: 0, width: 19, height: 200)))
+        XCTAssertTrue(CaptureFocusChain.isTiny(CGRect(x: 0, y: 0, width: 200, height: 19)))
+        XCTAssertFalse(CaptureFocusChain.isTiny(CGRect(x: 0, y: 0, width: 20, height: 20)))
+        XCTAssertFalse(CaptureFocusChain.isTiny(CGRect(x: 0, y: 0, width: 40, height: 40)))
+    }
+
     private func makeImage(width: Int, height: Int, rows: [(UInt8, UInt8, UInt8)]) -> CGImage {
         var px = [UInt8]()
         for y in 0..<height {

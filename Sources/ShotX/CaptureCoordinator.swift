@@ -11,8 +11,22 @@ enum CaptureOverlayLayout {
         fixedWidth + edgeInset * 2 > visibleWidth
     }
 
+    static func toolbarSize(_ size: CGSize, visibleFrame: CGRect) -> CGSize {
+        let bounds = visibleFrame.insetBy(dx: edgeInset, dy: edgeInset)
+        return CGSize(width: min(size.width, bounds.width), height: min(size.height, bounds.height))
+    }
+
+    static func toolbarFrame(size: CGSize, selection: CGRect, visibleFrame: CGRect) -> CGRect {
+        let bounds = visibleFrame.insetBy(dx: edgeInset, dy: edgeInset)
+        let size = toolbarSize(size, visibleFrame: visibleFrame)
+        let below = selection.minY - size.height - edgeInset
+        let y = below >= bounds.minY ? below : min(bounds.maxY - size.height, max(bounds.minY, selection.maxY + edgeInset))
+        let x = min(max(bounds.minX, selection.midX - size.width / 2), bounds.maxX - size.width)
+        return CGRect(origin: CGPoint(x: x, y: y), size: size)
+    }
+
     static func optionsPanelSize(contentHeight: CGFloat, visibleFrame: CGRect) -> CGSize {
-        CGSize(width: optionsWidth, height: min(max(120, contentHeight), max(1, visibleFrame.height - edgeInset * 2)))
+        CGSize(width: min(optionsWidth, max(1, visibleFrame.width - edgeInset * 2)), height: min(max(120, contentHeight), max(1, visibleFrame.height - edgeInset * 2)))
     }
 
     static func optionsPanelFrame(contentHeight: CGFloat, visibleFrame: CGRect, toolbarFrame: CGRect) -> CGRect {
@@ -23,6 +37,51 @@ enum CaptureOverlayLayout {
         origin.x = min(max(bounds.minX, origin.x), max(bounds.minX, bounds.maxX - size.width))
         origin.y = min(max(bounds.minY, origin.y), max(bounds.minY, bounds.maxY - size.height))
         return CGRect(origin: origin, size: size)
+    }
+}
+
+enum CaptureFocusChain {
+    static let minimumSelectionSide: CGFloat = 20
+
+    static func isTiny(_ selection: CGRect) -> Bool {
+        selection.width < minimumSelectionSide || selection.height < minimumSelectionSide
+    }
+
+    static func views(selection: NSView, handles: [NSView], toolbar: [NSView], options: [NSView], outputs: [NSView]) -> [NSView] {
+        [selection] + handles + toolbar + options + outputs
+    }
+
+    /// Links views into a cyclic Tab/Shift+Tab chain (previousKeyView is derived by AppKit).
+    static func link(_ views: [NSView]) {
+        guard !views.isEmpty else { return }
+        for (index, view) in views.enumerated() { view.nextKeyView = views[(index + 1) % views.count] }
+    }
+
+    /// Window-aware focus bridge. The options panel is a separate `NSPanel` window, so the
+    /// overlay window chain (selection → eight handles → toolbar → outputs) and the panel
+    /// chain are linked independently and bridged across windows: Tab/Shift+Tab flows into
+    /// the panel and wraps back to the selection target.
+    static func linkWindowAware(overlayViews: [NSView], panelViews: [NSView]) {
+        link(overlayViews)
+        guard !panelViews.isEmpty else { return }
+        link(panelViews)
+        overlayViews.last?.nextKeyView = panelViews.first
+        panelViews.last?.nextKeyView = overlayViews.first
+    }
+}
+
+enum AccessibilityAnnouncements {
+    static let interval: TimeInterval = 0.5
+
+    static func shouldPost(lastAnnouncementAt: Date?, now: Date = .now) -> Bool {
+        lastAnnouncementAt.map { now.timeIntervalSince($0) >= interval } ?? true
+    }
+
+    static func post(_ announcement: String, on element: Any) {
+        NSAccessibility.post(element: element, notification: .announcementRequested, userInfo: [
+            .announcement: announcement,
+            .priority: NSAccessibilityPriorityLevel.medium.rawValue
+        ])
     }
 }
 
@@ -243,6 +302,26 @@ private enum SelectionHandle {
     case move, north, south, east, west, northEast, northWest, southEast, southWest
 }
 
+private final class SelectionFocusTarget: NSView {
+    var onArrowKey: ((NSEvent) -> Void)?
+
+    override var acceptsFirstResponder: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func becomeFirstResponder() -> Bool { needsDisplay = true; return true }
+    override func resignFirstResponder() -> Bool { needsDisplay = true; return true }
+    override func keyDown(with event: NSEvent) {
+        if [123, 124, 125, 126].contains(event.keyCode) { onArrowKey?(event) }
+        else { super.keyDown(with: event) }
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        guard (window?.firstResponder as? SelectionFocusTarget) === self else { return }
+        NSColor.controlAccentColor.setStroke()
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 3, yRadius: 3)
+        path.lineWidth = 2
+        path.stroke()
+    }
+}
+
 final class SelectionView: NSView {
     var onCancel: (() -> Void)?
     var onSelection: ((CGRect) -> Void)?
@@ -278,6 +357,11 @@ final class SelectionView: NSView {
     private var brushSlider: BrushSlider?
     private var sizeValueLabel: NSTextField?
     private var optionsControls: [NSView] = []
+    private var toolbarControls: [NSView] = []
+    private var outputControls: [NSView] = []
+    private var selectionFocusTarget: SelectionFocusTarget?
+    private var handleFocusTargets: [(SelectionHandle, SelectionFocusTarget)] = []
+    private var lastStyleAnnouncementAt: Date?
     private var eyedropperMonitor: Any?
     private var eyedropperClickMonitor: Any?
     private var eyedropperKeyMonitor: Any?
@@ -458,7 +542,8 @@ final class SelectionView: NSView {
 
     private func drawLabel(focus: CGRect) {
         let scale = targetScreen.backingScaleFactor
-        let size = focus.isEmpty ? "" : "  ·  \(Int((focus.width * scale).rounded())) × \(Int((focus.height * scale).rounded())) px"
+        let showSize = !focus.isEmpty && !CaptureFocusChain.isTiny(selection)
+        let size = showSize ? "  ·  \(Int((focus.width * scale).rounded())) × \(Int((focus.height * scale).rounded())) px" : ""
         let hint: String
         if setupActive {
             hint = ""
@@ -500,8 +585,9 @@ final class SelectionView: NSView {
         self.editor = editor
         addSubview(editor)
         updateEditorFrame()
+        makeSelectionFocusTargets()
         makeToolbar()
-        window?.makeFirstResponder(editor)
+        window?.makeFirstResponder(selectionFocusTarget)
         NSCursor.pop(); NSCursor.arrow.push()
         needsDisplay = true
     }
@@ -509,16 +595,24 @@ final class SelectionView: NSView {
     private func makeToolbar() {
         let tools = NSSegmentedControl(labels: AnnotationTool.allCases.map(\.rawValue), trackingMode: .selectOne, target: self, action: #selector(toolChanged(_:)))
         tools.selectedSegment = 0
+        tools.controlSize = .small
+        for index in 0..<tools.segmentCount { tools.setWidth(32, forSegment: index) }
         toolControl = tools
         styleButton.target = self; styleButton.action = #selector(stylePressed); styleButton.setAccessibilityLabel("样式"); styleButton.toolTip = "样式"
-        styleButton.widthAnchor.constraint(equalToConstant: 84).isActive = true
-        let editButtons = [tools, button("撤销", #selector(undoPressed)), button("重做", #selector(redoPressed)), styleButton]
+        styleButton.controlSize = .small
+        styleButton.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        let undo = button("撤销", #selector(undoPressed)); undo.controlSize = .small
+        let redo = button("重做", #selector(redoPressed)); redo.controlSize = .small
+        let editButtons = [tools, undo, redo, styleButton]
         let outputButtons = [button("复制", #selector(copyPressed)), button("保存…", #selector(savePressed)), button("分享…", #selector(sharePressed)), button("贴图", #selector(pinPressed)), button("关闭", #selector(closePressed))]
-        let toolRow = NSStackView(views: editButtons); toolRow.orientation = .horizontal; toolRow.spacing = 7; toolRow.alignment = .centerY
-        let outputRow = NSStackView(views: outputButtons); outputRow.orientation = .horizontal; outputRow.spacing = 7; outputRow.alignment = .centerY
+        toolbarControls = [tools, undo, redo, styleButton]
+        outputControls = outputButtons
+        outputButtons.forEach { $0.controlSize = .small }
+        let toolRow = NSStackView(views: editButtons); toolRow.orientation = .horizontal; toolRow.spacing = 4; toolRow.alignment = .centerY
+        let outputRow = NSStackView(views: outputButtons); outputRow.orientation = .horizontal; outputRow.spacing = 4; outputRow.alignment = .centerY
         let toolbar = NSVisualEffectView(frame: .zero); toolbar.material = .hudWindow; toolbar.state = .active; toolbar.wantsLayer = true; toolbar.layer?.cornerRadius = 10
         let content = NSStackView(views: [toolRow, outputRow])
-        content.spacing = 7; content.alignment = .centerY
+        content.spacing = 4; content.alignment = .centerY
         let twoLines = CaptureOverlayLayout.toolbarUsesTwoLines(fixedWidth: toolRow.fittingSize.width + outputRow.fittingSize.width + 7 + 20, visibleWidth: targetScreen.visibleFrame.width)
         content.orientation = twoLines ? .vertical : .horizontal
         toolbar.addSubview(content)
@@ -527,10 +621,97 @@ final class SelectionView: NSView {
         toolbar.layoutSubtreeIfNeeded()
         updateStyleControls(for: .select)
         toolbar.layoutSubtreeIfNeeded()
-        toolbarFixedSize = toolbar.fittingSize
+        let visible = targetScreen.visibleFrame.offsetBy(dx: -targetScreen.frame.minX, dy: -targetScreen.frame.minY)
+        toolbarFixedSize = CaptureOverlayLayout.toolbarSize(toolbar.fittingSize, visibleFrame: visible)
         toolbarFixedSize.height = twoLines ? 80 : 40
         addSubview(toolbar); self.toolbar = toolbar
         positionToolbar()
+        updateFocusChain()
+    }
+
+    private func makeSelectionFocusTargets() {
+        let selectionTarget = SelectionFocusTarget(frame: selection)
+        selectionTarget.setAccessibilityLabel("截图区域")
+        selectionTarget.onArrowKey = { [weak self] event in self?.nudgeSelectionFocus(nil, with: event) }
+        addSubview(selectionTarget)
+        selectionFocusTarget = selectionTarget
+
+        let handles: [(SelectionHandle, String)] = [(.southWest, "截图区域左下角"), (.south, "截图区域下边"), (.southEast, "截图区域右下角"), (.west, "截图区域左边"), (.east, "截图区域右边"), (.northWest, "截图区域左上角"), (.north, "截图区域上边"), (.northEast, "截图区域右上角")]
+        handleFocusTargets = handles.map { handle, label in
+            let target = SelectionFocusTarget(frame: .zero)
+            target.setAccessibilityLabel(label)
+            target.onArrowKey = { [weak self] event in self?.nudgeSelectionFocus(handle, with: event) }
+            addSubview(target)
+            return (handle, target)
+        }
+        updateSelectionFocusTargets()
+    }
+
+    private func updateFocusChain() {
+        guard let selectionFocusTarget else { return }
+        let tiny = CaptureFocusChain.isTiny(selection)
+        let toolbarViews = tiny ? [] : toolbarControls
+        let outputViews = tiny ? [] : outputControls
+        let optionsVisible = optionsPanel?.isVisible == true && !tiny
+        CaptureFocusChain.linkWindowAware(
+            overlayViews: [selectionFocusTarget] + handleFocusTargets.map(\.1) + toolbarViews + outputViews,
+            panelViews: optionsVisible ? optionsControls : []
+        )
+    }
+
+    private func updateSelectionFocusTargets() {
+        selectionFocusTarget?.frame = selection
+        for (handle, target) in handleFocusTargets {
+            let point = handlePoint(handle)
+            target.frame = NSRect(x: point.x - 10, y: point.y - 10, width: 20, height: 20)
+        }
+    }
+
+    private func handlePoint(_ handle: SelectionHandle) -> CGPoint {
+        switch handle {
+        case .southWest: CGPoint(x: selection.minX, y: selection.minY)
+        case .south: CGPoint(x: selection.midX, y: selection.minY)
+        case .southEast: CGPoint(x: selection.maxX, y: selection.minY)
+        case .west: CGPoint(x: selection.minX, y: selection.midY)
+        case .east: CGPoint(x: selection.maxX, y: selection.midY)
+        case .northWest: CGPoint(x: selection.minX, y: selection.maxY)
+        case .north: CGPoint(x: selection.midX, y: selection.maxY)
+        case .northEast: CGPoint(x: selection.maxX, y: selection.maxY)
+        case .move: CGPoint(x: selection.midX, y: selection.midY)
+        }
+    }
+
+    private func nudgeSelectionFocus(_ handle: SelectionHandle?, with event: NSEvent) {
+        let amount = (event.modifierFlags.contains(.shift) ? 10 : 1) / targetScreen.backingScaleFactor
+        let delta = event.keyCode == 123 ? (-amount, 0) : event.keyCode == 124 ? (amount, 0) : event.keyCode == 125 ? (0, -amount) : (0, amount)
+        guard let handle else { nudgeSelection(dx: delta.0, dy: delta.1); return }
+        remember()
+        let minimum = 1 / targetScreen.backingScaleFactor
+        var rect = selection
+        switch handle {
+        case .west, .northWest, .southWest:
+            let x = min(max(bounds.minX, rect.minX + delta.0), rect.maxX - minimum)
+            rect.size.width += rect.minX - x; rect.origin.x = x
+        default: break
+        }
+        switch handle {
+        case .east, .northEast, .southEast:
+            rect.size.width = max(minimum, min(bounds.maxX, rect.maxX + delta.0) - rect.minX)
+        default: break
+        }
+        switch handle {
+        case .south, .southWest, .southEast:
+            let y = min(max(bounds.minY, rect.minY + delta.1), rect.maxY - minimum)
+            rect.size.height += rect.minY - y; rect.origin.y = y
+        default: break
+        }
+        switch handle {
+        case .north, .northWest, .northEast:
+            rect.size.height = max(minimum, min(bounds.maxY, rect.maxY + delta.1) - rect.minY)
+        default: break
+        }
+        selection = rect
+        updateEditorFrame(); needsDisplay = true; notifySelectionChanged()
     }
 
     private func button(_ title: String, _ action: Selector) -> NSButton { NSButton(title: title, target: self, action: action) }
@@ -574,6 +755,8 @@ final class SelectionView: NSView {
         positionOptionsPanel()
         panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(optionsControls.first)
+        updateFocusChain()
+        AccessibilityAnnouncements.post("样式，颜色和粗细", on: panel)
         installOptionsMonitors()
     }
 
@@ -583,6 +766,7 @@ final class SelectionView: NSView {
         panel.contentView = content
         panel.setContentSize(CaptureOverlayLayout.optionsPanelSize(contentHeight: optionsContentHeight, visibleFrame: targetScreen.visibleFrame))
         positionOptionsPanel()
+        updateFocusChain()
     }
 
     private func hideOptionsPanel() {
@@ -592,6 +776,7 @@ final class SelectionView: NSView {
         optionsKeyMonitor = nil
         optionsPanel?.orderOut(nil)
         optionsPanel = nil
+        updateFocusChain()
         window?.makeKey()
         window?.makeFirstResponder(styleButton)
     }
@@ -630,9 +815,6 @@ final class SelectionView: NSView {
         scroll.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(scroll)
         NSLayoutConstraint.activate([scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10), scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10), scroll.topAnchor.constraint(equalTo: content.topAnchor, constant: 10), scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10)])
-        for (index, control) in optionsControls.enumerated() {
-            control.nextKeyView = optionsControls[(index + 1) % optionsControls.count]
-        }
         return content
     }
 
@@ -860,6 +1042,10 @@ final class SelectionView: NSView {
         updateMemoryLabel(for: tool)
         updateSizeValue(value, for: tool)
         updateStyleButton()
+        let now = Date.now
+        guard AccessibilityAnnouncements.shouldPost(lastAnnouncementAt: lastStyleAnnouncementAt, now: now) else { return }
+        lastStyleAnnouncementAt = now
+        AccessibilityAnnouncements.post("\(tool.styleLabel) \(Int(value)) \(tool.styleRange.unit == "pt" ? "点" : "像素")", on: sender)
     }
 
     private func commitBrushSize() {
@@ -1008,15 +1194,21 @@ final class SelectionView: NSView {
     }
     private func continueSelectionMove(with event: NSEvent) { guard movingSelection, let activeHandle else { return }; resizeSelection(handle: activeHandle, to: convert(event.locationInWindow, from: nil)); updateEditorFrame(); needsDisplay = true }
     private func endSelectionMove() { movingSelection = false; activeHandle = nil }
-    private func updateEditorFrame() { editor?.update(sourceRect: selection); editor?.frame.origin = selection.origin; positionToolbar() }
+    private func updateEditorFrame() { editor?.update(sourceRect: selection); editor?.frame.origin = selection.origin; updateSelectionFocusTargets(); positionToolbar() }
     private func positionToolbar() {
         guard let toolbar else { return }
-        if toolbarFixedSize.width > 0 { toolbar.frame.size = toolbarFixedSize }
-        else { toolbar.frame.size = toolbar.fittingSize }
-        let below = selection.minY - toolbar.frame.height - 10
-        let y = below >= 8 ? below : min(bounds.maxY - toolbar.frame.height - 8, selection.maxY + 10)
-        toolbar.frame.origin = CGPoint(x: min(max(8, selection.midX - toolbar.frame.width / 2), bounds.maxX - toolbar.frame.width - 8), y: y)
+        let tiny = CaptureFocusChain.isTiny(selection)
+        toolbar.isHidden = tiny
+        if tiny {
+            if optionsPanel?.isVisible == true { hideOptionsPanel() }
+            updateFocusChain()
+            return
+        }
+        let size = toolbarFixedSize.width > 0 ? toolbarFixedSize : toolbar.fittingSize
+        let visible = targetScreen.visibleFrame.offsetBy(dx: -targetScreen.frame.minX, dy: -targetScreen.frame.minY)
+        toolbar.frame = CaptureOverlayLayout.toolbarFrame(size: size, selection: selection, visibleFrame: visible)
         positionOptionsPanel()
+        updateFocusChain()
     }
 
     private func positionOptionsPanel() {
@@ -1104,11 +1296,10 @@ private final class OptionsPanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
-private final class BrushSlider: NSSlider {
+final class BrushSlider: NSSlider {
     var onBegin: (() -> Void)?
     var onCommit: (() -> Void)?
-    override func mouseDown(with event: NSEvent) { onBegin?(); super.mouseDown(with: event) }
-    override func mouseUp(with event: NSEvent) { super.mouseUp(with: event); onCommit?() }
+    override func mouseDown(with event: NSEvent) { onBegin?(); super.mouseDown(with: event); onCommit?() }
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 123 || event.keyCode == 124 {
             let step = event.modifierFlags.contains(.shift) ? 5.0 : 1.0

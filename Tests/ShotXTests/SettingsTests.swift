@@ -54,6 +54,63 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(decoded.annotationSizes[AnnotationTool.mosaic.rawValue], 40)
     }
 
+    func testCaptureOverlayToolbarStaysInsideNarrowVisibleFrame() {
+        XCTAssertTrue(CaptureOverlayLayout.toolbarUsesTwoLines(fixedWidth: 620, visibleWidth: 500))
+        let visible = CGRect(x: 0, y: 0, width: 500, height: 300)
+        let toolbar = CaptureOverlayLayout.toolbarFrame(size: CGSize(width: 546, height: 80), selection: CGRect(x: 420, y: 20, width: 60, height: 40), visibleFrame: visible)
+        XCTAssertTrue(visible.insetBy(dx: 8, dy: 8).contains(toolbar))
+    }
+
+    func testCaptureOverlayOptionsPanelStaysInsideVeryNarrowVisibleFrame() {
+        let veryNarrowVisible = CGRect(x: 0, y: 0, width: 315, height: 300)
+        let veryNarrowFrame = CaptureOverlayLayout.optionsPanelFrame(contentHeight: 480, visibleFrame: veryNarrowVisible, toolbarFrame: CGRect(x: 270, y: 100, width: 40, height: 40))
+        XCTAssertEqual(veryNarrowFrame.width, 299)
+        XCTAssertTrue(veryNarrowVisible.insetBy(dx: 8, dy: 8).contains(veryNarrowFrame))
+    }
+
+    @MainActor
+    func testAccessibilityAnnouncementThrottle() {
+        let start = Date(timeIntervalSinceReferenceDate: 0)
+        XCTAssertTrue(AccessibilityAnnouncements.shouldPost(lastAnnouncementAt: nil, now: start))
+        XCTAssertFalse(AccessibilityAnnouncements.shouldPost(lastAnnouncementAt: start, now: start.addingTimeInterval(0.49)))
+        XCTAssertTrue(AccessibilityAnnouncements.shouldPost(lastAnnouncementAt: start, now: start.addingTimeInterval(0.5)))
+        AccessibilityAnnouncements.post("样式，颜色和粗细", on: NSView())
+    }
+
+    @MainActor
+    func testBrushSliderCommitsAfterMouseTrackingEnds() {
+        let slider = BrushSlider(value: 2, minValue: 1, maxValue: 8, target: nil, action: nil)
+        var commits = 0
+        slider.onCommit = { commits += 1 }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 100, height: 30), styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(slider)
+        slider.frame = NSRect(x: 0, y: 0, width: 100, height: 30)
+        let down = NSEvent.mouseEvent(with: .leftMouseDown, location: NSPoint(x: 20, y: 15), modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
+        let up = NSEvent.mouseEvent(with: .leftMouseUp, location: NSPoint(x: 80, y: 15), modifierFlags: [], timestamp: 1, windowNumber: window.windowNumber, context: nil, eventNumber: 2, clickCount: 1, pressure: 0)!
+        NSApp.postEvent(up, atStart: false)
+        slider.mouseDown(with: down)
+        XCTAssertEqual(commits, 1)
+    }
+
+    @MainActor
+    func testLiveAnnotationStyleDrivesNextStrokeAndRestores() throws {
+        let image = CGImage(width: 10, height: 10, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 40, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue), provider: CGDataProvider(data: Data(repeating: 255, count: 400) as CFData)!, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+        let view = AnnotationView(image: image, settings: .defaults)
+        view.tool = .pen
+        view.applyStyleLive(color: .systemBlue, size: 7)
+        let down = NSEvent.mouseEvent(with: .leftMouseDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        let up = NSEvent.mouseEvent(with: .leftMouseUp, location: CGPoint(x: 5, y: 5), modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
+        view.mouseDown(with: down); view.mouseUp(with: up)
+        guard case .line(_, _, _, _, let size)? = view.stateSnapshot.annotations.last else { return XCTFail("Expected stroke") }
+        XCTAssertEqual(size, 7)
+
+        var settings = AppSettings.defaults
+        settings.annotationSizes[AnnotationTool.pen.rawValue] = 7
+        let reopened = AnnotationView(image: image, settings: try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings)))
+        XCTAssertEqual(reopened.styleSize(for: .pen), 7)
+    }
+
     func testVideoTrimFractionsRemainOrderedAndBounded() {
         XCTAssertEqual(VideoExporter.fractions(start: -1, end: 2).0, 0)
         XCTAssertEqual(VideoExporter.fractions(start: -1, end: 2).1, 1)
