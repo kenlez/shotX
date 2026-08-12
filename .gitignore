@@ -9,6 +9,7 @@ ShotX.app/
 .opencode/
 .multica/
 .agent_context/
+AGENTS.md
 node_modules/
 
 # Editor
