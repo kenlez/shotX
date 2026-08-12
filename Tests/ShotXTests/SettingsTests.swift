@@ -55,6 +55,22 @@ final class SettingsTests: XCTestCase {
     }
 
     @MainActor
+    func testBrushSliderCommitsAfterMouseTrackingEnds() {
+        let slider = BrushSlider(value: 2, minValue: 1, maxValue: 8, target: nil, action: nil)
+        var commits = 0
+        slider.onCommit = { commits += 1 }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 100, height: 30), styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = NSView(frame: window.frame)
+        window.contentView?.addSubview(slider)
+        slider.frame = NSRect(x: 0, y: 0, width: 100, height: 30)
+        let down = NSEvent.mouseEvent(with: .leftMouseDown, location: NSPoint(x: 20, y: 15), modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
+        let up = NSEvent.mouseEvent(with: .leftMouseUp, location: NSPoint(x: 80, y: 15), modifierFlags: [], timestamp: 1, windowNumber: window.windowNumber, context: nil, eventNumber: 2, clickCount: 1, pressure: 0)!
+        NSApp.postEvent(up, atStart: false)
+        slider.mouseDown(with: down)
+        XCTAssertEqual(commits, 1)
+    }
+
+    @MainActor
     func testLiveAnnotationStyleDrivesNextStrokeAndRestores() throws {
         let image = CGImage(width: 10, height: 10, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 40, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue), provider: CGDataProvider(data: Data(repeating: 255, count: 400) as CFData)!, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
         let view = AnnotationView(image: image, settings: .defaults)
