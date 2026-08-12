@@ -54,6 +54,13 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(decoded.annotationSizes[AnnotationTool.mosaic.rawValue], 40)
     }
 
+    func testCaptureOverlayToolbarStaysInsideNarrowVisibleFrame() {
+        XCTAssertTrue(CaptureOverlayLayout.toolbarUsesTwoLines(fixedWidth: 620, visibleWidth: 500))
+        let visible = CGRect(x: 0, y: 0, width: 500, height: 300)
+        let toolbar = CaptureOverlayLayout.toolbarFrame(size: CGSize(width: 546, height: 80), selection: CGRect(x: 420, y: 20, width: 60, height: 40), visibleFrame: visible)
+        XCTAssertTrue(visible.insetBy(dx: 8, dy: 8).contains(toolbar))
+    }
+
     @MainActor
     func testAccessibilityAnnouncementThrottle() {
         let start = Date(timeIntervalSinceReferenceDate: 0)
