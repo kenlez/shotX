@@ -119,7 +119,8 @@ final class AnnotationView: NSView {
     private var start: CGPoint?
     private var draft: CGPoint?
     private var cropRect: CGRect?
-    private let settings: AppSettings
+    private var liveColors: [String: NSColor]
+    private var liveSizes: [String: CGFloat]
     var managesOwnHistory = true
     var onWillChange: (() -> Void)?
     var onEscape: (() -> Void)?
@@ -139,7 +140,8 @@ final class AnnotationView: NSView {
         pixelsPerPoint = 1
         screenPointSize = size
         sourceRect = CGRect(origin: .zero, size: size)
-        self.settings = settings
+        liveColors = settings.annotationColors.mapValues { NSColor(hex: $0) ?? .systemRed }
+        liveSizes = settings.annotationSizes.mapValues { CGFloat($0) }
         super.init(frame: NSRect(origin: .zero, size: size)); wantsLayer = true
     }
     init(image: CGImage, screenPointSize: CGSize, sourceRect: CGRect, settings: AppSettings) {
@@ -148,7 +150,8 @@ final class AnnotationView: NSView {
         pixelsPerPoint = screenPointSize.width > 0 ? CGFloat(image.width) / screenPointSize.width : 1
         self.screenPointSize = screenPointSize
         self.sourceRect = sourceRect
-        self.settings = settings
+        liveColors = settings.annotationColors.mapValues { NSColor(hex: $0) ?? .systemRed }
+        liveSizes = settings.annotationSizes.mapValues { CGFloat($0) }
         super.init(frame: NSRect(origin: .zero, size: sourceRect.size)); wantsLayer = true
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -209,13 +212,20 @@ final class AnnotationView: NSView {
     func undo() { guard let state = undoStack.popLast() else { return }; redoStack.append(stateSnapshot); restore(state) }
     func redo() { guard let state = redoStack.popLast() else { return }; undoStack.append(stateSnapshot); restore(state) }
     func applyStyle(color: NSColor, size: Double) {
-        guard let selected else { return }; remember()
+        if selected != nil { remember() }
+        applyStyleLive(color: color, size: size)
+    }
+    func applyStyleLive(color: NSColor, size: Double) {
+        liveColors[tool.rawValue] = color
+        liveSizes[tool.rawValue] = CGFloat(size)
+        guard let selected else { return }
         switch annotations[selected] {
         case .line(let tool, let a, let b, _, _): annotations[selected] = .line(tool, a, b, color, size)
         case .text(let text, let point, _, _): annotations[selected] = .text(text, point, color, size)
         }
         needsDisplay = true
     }
+    func styleSize(for tool: AnnotationTool) -> Double { Double(liveSizes[tool.rawValue] ?? CGFloat(AnnotationTool.defaultSize(for: tool))) }
 
     override func draw(_ dirtyRect: NSRect) {
         drawBaseImage()
@@ -329,8 +339,8 @@ final class AnnotationView: NSView {
     }
     private func offset(_ item: Annotation, dx: CGFloat, dy: CGFloat) -> Annotation { switch item { case .line(let tool, let a, let b, let color, let width): .line(tool, CGPoint(x: a.x + dx, y: a.y + dy), CGPoint(x: b.x + dx, y: b.y + dy), color, width); case .text(let text, let point, let color, let size): .text(text, CGPoint(x: point.x + dx, y: point.y + dy), color, size) } }
     private func bounds(of item: Annotation) -> CGRect { switch item { case .line(_, let a, let b, _, let width): rect(a, b).insetBy(dx: -max(4, width), dy: -max(4, width)); case .text(let text, let point, _, let size): CGRect(origin: point, size: text.size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold)])) } }
-    private func color(for tool: AnnotationTool) -> NSColor { NSColor(hex: settings.annotationColors[tool.rawValue] ?? "#FF3B30") ?? .systemRed }
-    private func size(for tool: AnnotationTool) -> CGFloat { settings.annotationSizes[tool.rawValue] ?? 2 }
+    private func color(for tool: AnnotationTool) -> NSColor { liveColors[tool.rawValue] ?? .systemRed }
+    private func size(for tool: AnnotationTool) -> CGFloat { liveSizes[tool.rawValue] ?? CGFloat(AnnotationTool.defaultSize(for: tool)) }
     private func rect(_ a: CGPoint, _ b: CGPoint) -> CGRect { CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y)) }
     private func bounded(_ point: CGPoint) -> CGPoint { CGPoint(x: min(max(0, point.x), bounds.width), y: min(max(0, point.y), bounds.height)) }
 }

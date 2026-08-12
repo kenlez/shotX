@@ -54,6 +54,24 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(decoded.annotationSizes[AnnotationTool.mosaic.rawValue], 40)
     }
 
+    @MainActor
+    func testLiveAnnotationStyleDrivesNextStrokeAndRestores() throws {
+        let image = CGImage(width: 10, height: 10, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 40, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue), provider: CGDataProvider(data: Data(repeating: 255, count: 400) as CFData)!, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+        let view = AnnotationView(image: image, settings: .defaults)
+        view.tool = .pen
+        view.applyStyleLive(color: .systemBlue, size: 7)
+        let down = NSEvent.mouseEvent(with: .leftMouseDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        let up = NSEvent.mouseEvent(with: .leftMouseUp, location: CGPoint(x: 5, y: 5), modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
+        view.mouseDown(with: down); view.mouseUp(with: up)
+        guard case .line(_, _, _, _, let size)? = view.stateSnapshot.annotations.last else { return XCTFail("Expected stroke") }
+        XCTAssertEqual(size, 7)
+
+        var settings = AppSettings.defaults
+        settings.annotationSizes[AnnotationTool.pen.rawValue] = 7
+        let reopened = AnnotationView(image: image, settings: try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings)))
+        XCTAssertEqual(reopened.styleSize(for: .pen), 7)
+    }
+
     func testVideoTrimFractionsRemainOrderedAndBounded() {
         XCTAssertEqual(VideoExporter.fractions(start: -1, end: 2).0, 0)
         XCTAssertEqual(VideoExporter.fractions(start: -1, end: 2).1, 1)

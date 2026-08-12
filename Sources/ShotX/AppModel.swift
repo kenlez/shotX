@@ -69,7 +69,7 @@ struct AppSettings: Codable, Equatable {
     var showsClicks = true
     var countdown = 3
     var annotationColors = Dictionary(uniqueKeysWithValues: AnnotationTool.styledCases.map { ($0.rawValue, "#FF3B30") })
-    var annotationSizes = Dictionary(uniqueKeysWithValues: AnnotationTool.styledCases.map { ($0.rawValue, $0 == .text ? 16.0 : $0 == .mosaic ? 16.0 : 2.0) })
+    var annotationSizes = Dictionary(uniqueKeysWithValues: AnnotationTool.styledCases.map { ($0.rawValue, AnnotationTool.defaultSize(for: $0)) })
     var lastSaveDirectory: String?
     var shortcuts = Dictionary(uniqueKeysWithValues: CaptureMode.allCases.map { ($0.rawValue, Shortcut.defaults[$0]!) })
 
@@ -81,6 +81,28 @@ enum AnnotationTool: String, CaseIterable, Identifiable {
     case select = "选择", arrow = "箭头", rectangle = "矩形", pen = "画笔", text = "文字", mosaic = "马赛克", crop = "裁剪"
     var id: String { rawValue }
     static let styledCases: [AnnotationTool] = [.arrow, .rectangle, .pen, .text, .mosaic]
+
+    /// Continuous draggable brush range and discrete preset values for the tool options popover (FR-CAP-15/16).
+    var styleRange: (min: Double, max: Double, presets: [Double], unit: String) {
+        switch self {
+        case .text: (11, 32, [11, 13, 16, 24, 32], "pt")
+        case .mosaic: (8, 40, [8, 16, 24, 40], "px")
+        case .select, .crop: (0, 0, [], "")
+        default: (1, 8, [1, 2, 4, 8], "pt")
+        }
+    }
+
+    var styleLabel: String {
+        switch self {
+        case .text: "字号"
+        case .mosaic: "笔刷大小"
+        default: "粗细"
+        }
+    }
+
+    var styleAccessibilityLabel: String { "\(styleLabel)（\(styleRange.unit)）" }
+    func styleAccessibilityValue(_ value: Double) -> String { "\(Int(value)) \(styleRange.unit)" }
+    static func defaultSize(for tool: AnnotationTool) -> Double { tool == .text || tool == .mosaic ? 16 : 2 }
 }
 
 enum RecentResult {
