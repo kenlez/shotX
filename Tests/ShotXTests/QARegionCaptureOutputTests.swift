@@ -3,6 +3,20 @@ import XCTest
 @testable import ShotX
 
 final class QARegionCaptureOutputTests: XCTestCase {
+    @MainActor func testCaptureFocusChainCyclesThroughSelectionHandlesToolbarOptionsAndOutputs() {
+        let selection = NSView()
+        let handles = (0..<8).map { _ in NSView() }
+        let toolbar = (0..<4).map { _ in NSView() }
+        let options = (0..<3).map { _ in NSView() }
+        let outputs = (0..<5).map { _ in NSView() }
+        let chain = CaptureFocusChain.views(selection: selection, handles: handles, toolbar: toolbar, options: options, outputs: outputs)
+
+        CaptureFocusChain.link(chain)
+
+        XCTAssertEqual(chain.count, 21)
+        for (index, view) in chain.enumerated() { XCTAssertTrue(view.nextKeyView === chain[(index + 1) % chain.count]) }
+    }
+
     private func makeImage(width: Int, height: Int, rows: [(UInt8, UInt8, UInt8)]) -> CGImage {
         var px = [UInt8]()
         for y in 0..<height {
