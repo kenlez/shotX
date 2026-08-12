@@ -41,13 +41,32 @@ enum CaptureOverlayLayout {
 }
 
 enum CaptureFocusChain {
+    static let minimumSelectionSide: CGFloat = 20
+
+    static func isTiny(_ selection: CGRect) -> Bool {
+        selection.width < minimumSelectionSide || selection.height < minimumSelectionSide
+    }
+
     static func views(selection: NSView, handles: [NSView], toolbar: [NSView], options: [NSView], outputs: [NSView]) -> [NSView] {
         [selection] + handles + toolbar + options + outputs
     }
 
+    /// Links views into a cyclic Tab/Shift+Tab chain (previousKeyView is derived by AppKit).
     static func link(_ views: [NSView]) {
         guard !views.isEmpty else { return }
         for (index, view) in views.enumerated() { view.nextKeyView = views[(index + 1) % views.count] }
+    }
+
+    /// Window-aware focus bridge. The options panel is a separate `NSPanel` window, so the
+    /// overlay window chain (selection → eight handles → toolbar → outputs) and the panel
+    /// chain are linked independently and bridged across windows: Tab/Shift+Tab flows into
+    /// the panel and wraps back to the selection target.
+    static func linkWindowAware(overlayViews: [NSView], panelViews: [NSView]) {
+        link(overlayViews)
+        guard !panelViews.isEmpty else { return }
+        link(panelViews)
+        overlayViews.last?.nextKeyView = panelViews.first
+        panelViews.last?.nextKeyView = overlayViews.first
     }
 }
 
@@ -523,7 +542,8 @@ final class SelectionView: NSView {
 
     private func drawLabel(focus: CGRect) {
         let scale = targetScreen.backingScaleFactor
-        let size = focus.isEmpty ? "" : "  ·  \(Int((focus.width * scale).rounded())) × \(Int((focus.height * scale).rounded())) px"
+        let showSize = !focus.isEmpty && !CaptureFocusChain.isTiny(selection)
+        let size = showSize ? "  ·  \(Int((focus.width * scale).rounded())) × \(Int((focus.height * scale).rounded())) px" : ""
         let hint: String
         if setupActive {
             hint = ""
@@ -629,13 +649,14 @@ final class SelectionView: NSView {
 
     private func updateFocusChain() {
         guard let selectionFocusTarget else { return }
-        CaptureFocusChain.link(CaptureFocusChain.views(
-            selection: selectionFocusTarget,
-            handles: handleFocusTargets.map(\.1),
-            toolbar: toolbarControls,
-            options: optionsPanel?.isVisible == true ? optionsControls : [],
-            outputs: outputControls
-        ))
+        let tiny = CaptureFocusChain.isTiny(selection)
+        let toolbarViews = tiny ? [] : toolbarControls
+        let outputViews = tiny ? [] : outputControls
+        let optionsVisible = optionsPanel?.isVisible == true && !tiny
+        CaptureFocusChain.linkWindowAware(
+            overlayViews: [selectionFocusTarget] + handleFocusTargets.map(\.1) + toolbarViews + outputViews,
+            panelViews: optionsVisible ? optionsControls : []
+        )
     }
 
     private func updateSelectionFocusTargets() {
@@ -1176,10 +1197,18 @@ final class SelectionView: NSView {
     private func updateEditorFrame() { editor?.update(sourceRect: selection); editor?.frame.origin = selection.origin; updateSelectionFocusTargets(); positionToolbar() }
     private func positionToolbar() {
         guard let toolbar else { return }
+        let tiny = CaptureFocusChain.isTiny(selection)
+        toolbar.isHidden = tiny
+        if tiny {
+            if optionsPanel?.isVisible == true { hideOptionsPanel() }
+            updateFocusChain()
+            return
+        }
         let size = toolbarFixedSize.width > 0 ? toolbarFixedSize : toolbar.fittingSize
         let visible = targetScreen.visibleFrame.offsetBy(dx: -targetScreen.frame.minX, dy: -targetScreen.frame.minY)
         toolbar.frame = CaptureOverlayLayout.toolbarFrame(size: size, selection: selection, visibleFrame: visible)
         positionOptionsPanel()
+        updateFocusChain()
     }
 
     private func positionOptionsPanel() {
