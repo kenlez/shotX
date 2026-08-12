@@ -26,7 +26,7 @@ enum CaptureOverlayLayout {
     }
 
     static func optionsPanelSize(contentHeight: CGFloat, visibleFrame: CGRect) -> CGSize {
-        CGSize(width: optionsWidth, height: min(max(120, contentHeight), max(1, visibleFrame.height - edgeInset * 2)))
+        CGSize(width: min(optionsWidth, max(1, visibleFrame.width - edgeInset * 2)), height: min(max(120, contentHeight), max(1, visibleFrame.height - edgeInset * 2)))
     }
 
     static func optionsPanelFrame(contentHeight: CGFloat, visibleFrame: CGRect, toolbarFrame: CGRect) -> CGRect {

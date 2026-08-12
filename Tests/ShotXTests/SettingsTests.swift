@@ -61,6 +61,13 @@ final class SettingsTests: XCTestCase {
         XCTAssertTrue(visible.insetBy(dx: 8, dy: 8).contains(toolbar))
     }
 
+    func testCaptureOverlayOptionsPanelStaysInsideVeryNarrowVisibleFrame() {
+        let veryNarrowVisible = CGRect(x: 0, y: 0, width: 315, height: 300)
+        let veryNarrowFrame = CaptureOverlayLayout.optionsPanelFrame(contentHeight: 480, visibleFrame: veryNarrowVisible, toolbarFrame: CGRect(x: 270, y: 100, width: 40, height: 40))
+        XCTAssertEqual(veryNarrowFrame.width, 299)
+        XCTAssertTrue(veryNarrowVisible.insetBy(dx: 8, dy: 8).contains(veryNarrowFrame))
+    }
+
     @MainActor
     func testAccessibilityAnnouncementThrottle() {
         let start = Date(timeIntervalSinceReferenceDate: 0)
