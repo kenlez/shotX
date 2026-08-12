@@ -55,6 +55,15 @@ final class SettingsTests: XCTestCase {
     }
 
     @MainActor
+    func testAccessibilityAnnouncementThrottle() {
+        let start = Date(timeIntervalSinceReferenceDate: 0)
+        XCTAssertTrue(AccessibilityAnnouncements.shouldPost(lastAnnouncementAt: nil, now: start))
+        XCTAssertFalse(AccessibilityAnnouncements.shouldPost(lastAnnouncementAt: start, now: start.addingTimeInterval(0.49)))
+        XCTAssertTrue(AccessibilityAnnouncements.shouldPost(lastAnnouncementAt: start, now: start.addingTimeInterval(0.5)))
+        AccessibilityAnnouncements.post("样式，颜色和粗细", on: NSView())
+    }
+
+    @MainActor
     func testLiveAnnotationStyleDrivesNextStrokeAndRestores() throws {
         let image = CGImage(width: 10, height: 10, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 40, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue), provider: CGDataProvider(data: Data(repeating: 255, count: 400) as CFData)!, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
         let view = AnnotationView(image: image, settings: .defaults)
