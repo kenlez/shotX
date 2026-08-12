@@ -26,6 +26,21 @@ enum CaptureOverlayLayout {
     }
 }
 
+enum AccessibilityAnnouncements {
+    static let interval: TimeInterval = 0.5
+
+    static func shouldPost(lastAnnouncementAt: Date?, now: Date = .now) -> Bool {
+        lastAnnouncementAt.map { now.timeIntervalSince($0) >= interval } ?? true
+    }
+
+    static func post(_ announcement: String, on element: Any) {
+        NSAccessibility.post(element: element, notification: .announcementRequested, userInfo: [
+            .announcement: announcement,
+            .priority: NSAccessibilityPriorityLevel.medium.rawValue
+        ])
+    }
+}
+
 @MainActor
 final class CaptureCoordinator {
     static let shared = CaptureCoordinator()
@@ -278,6 +293,7 @@ final class SelectionView: NSView {
     private var brushSlider: BrushSlider?
     private var sizeValueLabel: NSTextField?
     private var optionsControls: [NSView] = []
+    private var lastStyleAnnouncementAt: Date?
     private var eyedropperMonitor: Any?
     private var eyedropperClickMonitor: Any?
     private var eyedropperKeyMonitor: Any?
@@ -574,6 +590,7 @@ final class SelectionView: NSView {
         positionOptionsPanel()
         panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(optionsControls.first)
+        AccessibilityAnnouncements.post("样式，颜色和粗细", on: panel)
         installOptionsMonitors()
     }
 
@@ -860,6 +877,10 @@ final class SelectionView: NSView {
         updateMemoryLabel(for: tool)
         updateSizeValue(value, for: tool)
         updateStyleButton()
+        let now = Date.now
+        guard AccessibilityAnnouncements.shouldPost(lastAnnouncementAt: lastStyleAnnouncementAt, now: now) else { return }
+        lastStyleAnnouncementAt = now
+        AccessibilityAnnouncements.post("\(tool.styleLabel) \(Int(value)) \(tool.styleRange.unit == "pt" ? "点" : "像素")", on: sender)
     }
 
     private func commitBrushSize() {
