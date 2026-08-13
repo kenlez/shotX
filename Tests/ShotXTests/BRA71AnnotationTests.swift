@@ -230,7 +230,7 @@ final class BRA71AnnotationTests: XCTestCase {
     // MARK: FR-BRA71-06 Recording setup panel centering
 
     func testRecordingSetupPanelCentersOnLargeSelection() {
-        let panel = CGSize(width: 300, height: 320)
+        let panel = RecordingSetupLayout.panelSize
         let selection = CGRect(x: 100, y: 100, width: 1600, height: 1000)
         let visible = CGRect(x: 0, y: 0, width: 2000, height: 1200)
         let frame = RecordingSetupLayout.frame(panelSize: panel, selection: selection, visibleFrame: visible)
@@ -240,7 +240,7 @@ final class BRA71AnnotationTests: XCTestCase {
     }
 
     func testRecordingSetupPanelAvoidsTinySelectionBelow() {
-        let panel = CGSize(width: 300, height: 320)
+        let panel = RecordingSetupLayout.panelSize
         let selection = CGRect(x: 500, y: 500, width: 240, height: 200)
         let visible = CGRect(x: 0, y: 0, width: 1440, height: 900)
         let frame = RecordingSetupLayout.frame(panelSize: panel, selection: selection, visibleFrame: visible)
@@ -251,7 +251,7 @@ final class BRA71AnnotationTests: XCTestCase {
     }
 
     func testRecordingSetupPanelTallSelectionKeepsHorizontalCenter() {
-        let panel = CGSize(width: 300, height: 320)
+        let panel = RecordingSetupLayout.panelSize
         let selection = CGRect(x: 500, y: 500, width: 200, height: 1600)
         let visible = CGRect(x: 0, y: 0, width: 2000, height: 2200)
         let frame = RecordingSetupLayout.frame(panelSize: panel, selection: selection, visibleFrame: visible)
@@ -261,7 +261,7 @@ final class BRA71AnnotationTests: XCTestCase {
     }
 
     func testRecordingSetupPanelFallsBackInsideVisibleFrame() {
-        let panel = CGSize(width: 300, height: 320)
+        let panel = RecordingSetupLayout.panelSize
         let visible = CGRect(x: 0, y: 0, width: 360, height: 360)
         let selection = CGRect(x: 0, y: 0, width: 360, height: 360)
         let frame = RecordingSetupLayout.frame(panelSize: panel, selection: selection, visibleFrame: visible)

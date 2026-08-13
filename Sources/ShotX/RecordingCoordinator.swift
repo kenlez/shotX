@@ -75,6 +75,7 @@ enum RecordingOutputSize {
 enum RecordingSetupLayout {
     static let edge: CGFloat = 8
     static let cornerHotspot: CGFloat = 20
+    static let panelSize = CGSize(width: 256, height: 140)
 
     static func frame(panelSize: CGSize, selection: CGRect, visibleFrame: CGRect) -> CGRect {
         func fits(_ rect: CGRect) -> Bool { visibleFrame.contains(rect) }
@@ -563,10 +564,8 @@ private final class RecordingSetupWindowController: NSWindowController {
     init(model: AppModel, screen: NSScreen, geometry: RecordingSetupGeometry, onStart: @escaping () -> Void, onReturn: @escaping () -> Void) {
         self.screen = screen
         self.geometry = geometry
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 320), styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
+        let panel = RecordingSetupPanel(contentRect: NSRect(origin: .zero, size: RecordingSetupLayout.panelSize), styleMask: [.borderless, .fullSizeContentView], backing: .buffered, defer: false)
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
-        panel.titleVisibility = .hidden
-        panel.titlebarAppearsTransparent = true
         panel.isMovableByWindowBackground = true
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
@@ -582,8 +581,32 @@ private final class RecordingSetupWindowController: NSWindowController {
         guard let window else { return }
         let selection = geometry.selection
         let visible = screen.visibleFrame.offsetBy(dx: -screen.frame.minX, dy: -screen.frame.minY)
-        let frame = RecordingSetupLayout.frame(panelSize: window.frame.size, selection: selection, visibleFrame: visible)
+        let frame = RecordingSetupLayout.frame(panelSize: RecordingSetupLayout.panelSize, selection: selection, visibleFrame: visible)
         window.setFrameOrigin(NSPoint(x: screen.frame.minX + frame.minX, y: screen.frame.minY + frame.minY))
+    }
+}
+
+private final class RecordingSetupPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
+/// FR-BRA71-07 config actions shared by the setup menu view and its unit tests.
+/// Speaker/mic toggles reuse existing `AppSettings` state and permission requests.
+@MainActor
+enum RecordingSetupActions {
+    static func toggleSystemAudio(on model: AppModel) {
+        model.settings.systemAudio.toggle()
+        if model.settings.systemAudio { model.request(.systemAudio) }
+    }
+
+    static func toggleMicrophone(on model: AppModel) {
+        model.settings.microphone.toggle()
+        if model.settings.microphone { model.request(.microphone) }
+    }
+
+    static func micUnavailable(on model: AppModel) -> Bool {
+        model.permissions[.microphone] != .allowed
     }
 }
 
@@ -592,88 +615,167 @@ private struct RecordingSetupView: View {
     @ObservedObject var geometry: RecordingSetupGeometry
     let onStart: () -> Void
     let onReturn: () -> Void
+    @State private var expanded: SetupEntry?
+
+    enum SetupEntry: CaseIterable, Identifiable {
+        case speaker, microphone, mouse
+        var id: Self { self }
+    }
+
+    private static let background = Color(red: Double(0x33) / 255, green: Double(0x33) / 255, blue: Double(0x33) / 255)
+    private static let accent = Color(red: Double(0x10) / 255, green: Double(0xAE) / 255, blue: Double(0xFF) / 255)
+    private static let idle = Color(red: Double(0x8A) / 255, green: Double(0x8A) / 255, blue: Double(0x8A) / 255)
 
     var body: some View {
         VStack(spacing: 0) {
-            header
+            entriesArea
+                .frame(maxHeight: .infinity)
             Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    soundGroup
-                    mouseGroup
-                    originalSizeGroup
-                    countdownGroup
-                }
-                .padding(12)
-            }
-            Divider()
-            footer
+                .overlay(Color.white.opacity(0.08))
+            startButton
         }
-        .frame(width: 300, height: 320)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+        .frame(width: RecordingSetupLayout.panelSize.width, height: RecordingSetupLayout.panelSize.height)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Self.background)
+                .shadow(color: .black.opacity(0.25), radius: 16, x: 0, y: 3)
+        )
         .onChange(of: model.settings) { model.persist() }
     }
 
-    private var header: some View {
-        HStack {
-            Text("录制设置").font(.title3.bold())
-            Text("MP4").font(.caption.bold()).padding(.horizontal, 7).padding(.vertical, 3).background(.secondary.opacity(0.14), in: Capsule())
-            Spacer()
+    private var entriesArea: some View {
+        Group {
+            switch expanded {
+            case .microphone: microphonePanel
+            case .mouse: mousePanel
+            case .speaker, nil: entries
+            }
         }
-        .frame(height: 36)
-        .padding(.horizontal, 12)
+        .frame(maxHeight: .infinity)
     }
 
-    private var soundGroup: some View {
-        GroupBox("声音") {
-            VStack(alignment: .leading, spacing: 8) {
-                Toggle("系统声音", isOn: binding(\.systemAudio, permission: .systemAudio))
-                if model.settings.systemAudio { LabeledContent("输出设备", value: "当前系统输出") }
-                Toggle("麦克风", isOn: binding(\.microphone, permission: .microphone))
-                if model.settings.microphone {
-                    Picker("麦克风", selection: plain(\.selectedMicrophoneID)) { Text("系统默认").tag(""); ForEach(audioDevices(), id: \.uniqueID) { Text($0.localizedName).tag($0.uniqueID) } }
+    private var entries: some View {
+        VStack(spacing: 4) {
+            speakerRow
+            microphoneRow
+            mouseRow
+        }
+    }
+
+    private var speakerRow: some View {
+        entryRow(symbol: "speaker.wave.2.fill", label: "扬声器", iconColor: model.settings.systemAudio ? Self.accent : Self.idle, action: toggleSystemAudio)
+            .accessibilityLabel("扬声器，\(model.settings.systemAudio ? "已开启" : "未开启")，开关")
+    }
+
+    private var microphoneRow: some View {
+        entryRow(symbol: "mic.fill", label: "麦克风", iconColor: model.settings.microphone ? Self.accent : Self.idle) { withAnimation { expanded = .microphone } }
+            .accessibilityLabel("麦克风，未开启，按钮")
+    }
+
+    private var mouseRow: some View {
+        entryRow(symbol: "mouse.fill", label: "鼠标设置", iconColor: .white) { withAnimation { expanded = .mouse } }
+            .accessibilityLabel("鼠标设置，按钮")
+    }
+
+    private func entryRow(symbol: String, label: String, iconColor: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: symbol)
+                    .font(.system(size: 18))
+                    .frame(width: 18, height: 18)
+                    .foregroundColor(iconColor)
+                Text(label)
+                    .font(.system(size: 13))
+                    .foregroundColor(.white)
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.4))
+            }
+            .frame(height: 24)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var microphonePanel: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            panelHeader(title: "麦克风") { withAnimation { expanded = nil } }
+            Toggle("麦克风", isOn: binding(\.microphone, permission: .microphone))
+                .font(.system(size: 13))
+            if model.settings.microphone {
+                Picker("麦克风", selection: plain(\.selectedMicrophoneID)) {
+                    Text("系统默认").tag("")
+                    ForEach(audioDevices(), id: \.uniqueID) { Text($0.localizedName).tag($0.uniqueID) }
                 }
-            }.padding(6)
-        }
-    }
-
-    private var mouseGroup: some View {
-        GroupBox("鼠标") {
-            HStack { Toggle("显示指针", isOn: plain(\.showsCursor)); Toggle("点击反馈", isOn: plain(\.showsClicks)) }.padding(6)
-        }
-    }
-
-    private var originalSizeGroup: some View {
-        GroupBox("原始尺寸") {
-            Text(RecordingOutputSize.displayText(source: geometry.selection.size, scale: geometry.scale))
-                .monospacedDigit()
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(6)
-        }
-    }
-
-    private var countdownGroup: some View {
-        GroupBox("倒计时") {
-            Picker("", selection: plain(\.countdown)) { Text("关闭").tag(0); Text("3 秒").tag(3) }
                 .labelsHidden()
-                .pickerStyle(.segmented)
-                .padding(6)
+                .pickerStyle(.menu)
+                .controlSize(.small)
+            }
+            if RecordingSetupActions.micUnavailable(on: model) || audioDevices().isEmpty {
+                Text("麦克风不可用")
+                    .font(.system(size: 11))
+                    .foregroundColor(Self.idle)
+            }
         }
+        .accessibilityLabel("麦克风设置")
     }
 
-    private var footer: some View {
-        HStack {
-            Button("返回选区", action: onReturn).keyboardShortcut(.escape)
-            Spacer()
-            Button("开始录制", action: onStart).keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
+    private var mousePanel: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            panelHeader(title: "鼠标设置") { withAnimation { expanded = nil } }
+            Toggle("显示指针", isOn: plain(\.showsCursor))
+                .font(.system(size: 13))
+            Toggle("点击反馈", isOn: plain(\.showsClicks))
+                .font(.system(size: 13))
+            Text(RecordingOutputSize.displayText(source: geometry.selection.size, scale: geometry.scale))
+                .font(.system(size: 11))
+                .monospacedDigit()
+                .foregroundColor(Self.idle)
         }
-        .frame(height: 48)
-        .padding(.horizontal, 12)
+        .accessibilityLabel("鼠标设置")
+    }
+
+    private func panelHeader(title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 11, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 13, weight: .medium))
+                Spacer()
+            }
+            .foregroundColor(.white)
+            .frame(height: 20)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("返回 \(title)")
+    }
+
+    private var startButton: some View {
+        Button(action: onStart) {
+            Text("开始录制")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(Color(red: Double(0x00) / 255, green: Double(0x3B) / 255, blue: Double(0x57) / 255))
+                .frame(maxWidth: .infinity)
+                .frame(height: 40)
+                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Self.accent))
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut(.defaultAction)
+        .accessibilityLabel("开始录制，按钮")
     }
 
     private func plain<T>(_ path: WritableKeyPath<AppSettings, T>) -> Binding<T> { Binding(get: { model.settings[keyPath: path] }, set: { model.settings[keyPath: path] = $0 }) }
     private func binding(_ path: WritableKeyPath<AppSettings, Bool>, permission: PermissionKind) -> Binding<Bool> {
         Binding(get: { model.settings[keyPath: path] }, set: { model.settings[keyPath: path] = $0; if $0 { model.request(permission) } })
+    }
+    private func toggleSystemAudio() {
+        RecordingSetupActions.toggleSystemAudio(on: model)
     }
     private func audioDevices() -> [AVCaptureDevice] {
         AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone, .external], mediaType: .audio, position: .unspecified).devices
@@ -738,22 +840,33 @@ private final class RecordingRegionBorderView: NSView {
     var state: RecordingOverlayState = .setup
     override var isFlipped: Bool { false }
 
+    private static let borderColor = NSColor(calibratedRed: CGFloat(0x07) / 255, green: CGFloat(0xC1) / 255, blue: CGFloat(0x60) / 255, alpha: 1)
+
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.black.setStroke()
-        let outer = NSBezierPath(rect: bounds.insetBy(dx: 0.5, dy: 0.5)); outer.lineWidth = 3; outer.stroke()
-        NSColor.white.setStroke()
-        let inner = NSBezierPath(rect: bounds.insetBy(dx: 2, dy: 2)); inner.lineWidth = 2; inner.stroke()
-        drawCorners()
+        Self.borderColor.setStroke()
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1.5, dy: 1.5), xRadius: 8, yRadius: 8)
+        path.lineWidth = 3
+        path.stroke()
+        if state == .setup { drawControlPoints() }
         let label = NSAttributedString(string: state.label, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 13, weight: .bold), .foregroundColor: NSColor.white])
         let size = label.size()
         let rect = CGRect(x: 4, y: max(4, bounds.height - size.height - 10), width: size.width + 14, height: size.height + 8)
         NSColor.black.withAlphaComponent(0.88).setFill(); NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill(); label.draw(at: CGPoint(x: rect.minX + 7, y: rect.minY + 4))
     }
 
-    private func drawCorners() {
-        NSColor.white.setStroke()
-        for (x, y, sx, sy) in [(3.0, 3.0, 1.0, 1.0), (bounds.maxX - 3, 3, -1, 1), (3, bounds.maxY - 3, 1, -1), (bounds.maxX - 3, bounds.maxY - 3, -1, -1)] {
-            let path = NSBezierPath(); path.move(to: CGPoint(x: x + 16 * sx, y: y)); path.line(to: CGPoint(x: x, y: y)); path.line(to: CGPoint(x: x, y: y + 16 * sy)); path.lineWidth = 3; path.stroke()
+    private func drawControlPoints() {
+        let points = [
+            CGPoint(x: bounds.minX, y: bounds.minY), CGPoint(x: bounds.midX, y: bounds.minY), CGPoint(x: bounds.maxX, y: bounds.minY),
+            CGPoint(x: bounds.minX, y: bounds.midY), CGPoint(x: bounds.maxX, y: bounds.midY),
+            CGPoint(x: bounds.minX, y: bounds.maxY), CGPoint(x: bounds.midX, y: bounds.maxY), CGPoint(x: bounds.maxX, y: bounds.maxY)
+        ]
+        for point in points {
+            Self.borderColor.setFill()
+            let path = NSBezierPath(ovalIn: CGRect(x: point.x - 5, y: point.y - 5, width: 10, height: 10))
+            path.fill()
+            NSColor.white.setStroke()
+            path.lineWidth = 2
+            path.stroke()
         }
     }
 }

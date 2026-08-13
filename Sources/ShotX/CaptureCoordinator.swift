@@ -234,6 +234,22 @@ final class CaptureCoordinator {
 
 private enum CaptureError: Error { case noContent }
 
+/// Resolves the SwiftPM resource bundle without crashing when the packaged
+/// `.app` places it under `Contents/Resources/` while the generated
+/// `Bundle.module` accessor only checks the bundle root and a build-machine
+/// path (`could not load resource bundle` → fatalError, SIGTRAP).
+enum FigmaResourceBundle {
+    static let bundleName = "ShotX_ShotX.bundle"
+
+    static func resolve(mainBundle: Bundle = .main) -> Bundle? {
+        let candidates = [
+            mainBundle.resourceURL?.appendingPathComponent(bundleName),
+            mainBundle.bundleURL.appendingPathComponent(bundleName)
+        ]
+        return candidates.compactMap { $0 }.compactMap { Bundle(url: $0) }.first
+    }
+}
+
 @MainActor
 final class SelectionWindowController: NSWindowController {
     var onCancel: (() -> Void)?
@@ -373,7 +389,8 @@ final class SelectionView: NSView {
     private var redoStack: [RegionEditSnapshot] = []
 
     private static func figmaImage(_ name: String) -> NSImage? {
-        let url = Bundle.module.url(forResource: name, withExtension: "svg", subdirectory: "Figma") ?? Bundle.module.url(forResource: name, withExtension: "svg")
+        guard let bundle = FigmaResourceBundle.resolve() else { return nil }
+        let url = bundle.url(forResource: name, withExtension: "svg", subdirectory: "Figma") ?? bundle.url(forResource: name, withExtension: "svg")
         return url.flatMap(NSImage.init(contentsOf:))
     }
 
@@ -528,18 +545,10 @@ final class SelectionView: NSView {
     }
 
     private func drawSetupBorder(around rect: CGRect) {
-        NSColor.black.setStroke()
-        let outer = NSBezierPath(rect: rect.insetBy(dx: 0.5, dy: 0.5)); outer.lineWidth = 3; outer.stroke()
-        NSColor.white.setStroke()
-        let inner = NSBezierPath(rect: rect.insetBy(dx: 2, dy: 2)); inner.lineWidth = 2; inner.stroke()
-        for (x, y, sx, sy) in [(3.0, 3.0, 1.0, 1.0), (rect.maxX - 3, rect.minY + 3, -1, 1), (rect.minX + 3, rect.maxY - 3, 1, -1), (rect.maxX - 3, rect.maxY - 3, -1, -1)] {
-            let path = NSBezierPath()
-            path.move(to: CGPoint(x: x + 16 * sx, y: y))
-            path.line(to: CGPoint(x: x, y: y))
-            path.line(to: CGPoint(x: x, y: y + 16 * sy))
-            path.lineWidth = 3
-            path.stroke()
-        }
+        NSColor(calibratedRed: CGFloat(0x07) / 255, green: CGFloat(0xC1) / 255, blue: CGFloat(0x60) / 255, alpha: 1).setStroke()
+        let path = NSBezierPath(roundedRect: rect.insetBy(dx: 1.5, dy: 1.5), xRadius: 8, yRadius: 8)
+        path.lineWidth = 3
+        path.stroke()
     }
 
     private func drawLabel(focus: CGRect) {
@@ -1210,8 +1219,19 @@ final class SelectionView: NSView {
         selection = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY).integral.intersection(bounds)
     }
     private func drawHandles(around rect: CGRect) {
-        NSColor.white.setFill()
-        for point in [CGPoint(x: rect.minX, y: rect.minY), CGPoint(x: rect.midX, y: rect.minY), CGPoint(x: rect.maxX, y: rect.minY), CGPoint(x: rect.minX, y: rect.midY), CGPoint(x: rect.maxX, y: rect.midY), CGPoint(x: rect.minX, y: rect.maxY), CGPoint(x: rect.midX, y: rect.maxY), CGPoint(x: rect.maxX, y: rect.maxY)] { NSBezierPath(ovalIn: CGRect(x: point.x - 4, y: point.y - 4, width: 8, height: 8)).fill() }
+        let points = [
+            CGPoint(x: rect.minX, y: rect.minY), CGPoint(x: rect.midX, y: rect.minY), CGPoint(x: rect.maxX, y: rect.minY),
+            CGPoint(x: rect.minX, y: rect.midY), CGPoint(x: rect.maxX, y: rect.midY),
+            CGPoint(x: rect.minX, y: rect.maxY), CGPoint(x: rect.midX, y: rect.maxY), CGPoint(x: rect.maxX, y: rect.maxY)
+        ]
+        NSColor(calibratedRed: CGFloat(0x07) / 255, green: CGFloat(0xC1) / 255, blue: CGFloat(0x60) / 255, alpha: 1).setFill()
+        for point in points {
+            let path = NSBezierPath(ovalIn: CGRect(x: point.x - 5, y: point.y - 5, width: 10, height: 10))
+            path.fill()
+            NSColor.white.setStroke()
+            path.lineWidth = 2
+            path.stroke()
+        }
     }
 }
 
