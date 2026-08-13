@@ -6,9 +6,9 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 交付版本 | ShotX 0.1.2（BRA-71 变更单 + BRA-76 修复） |
-| 交付基线 | 分支 `agent/bra-71-annotations`（PR #4 更新后 head，BRA-76 B1–B8 已修复） |
-| 包体附件 | BRA-76 重新打包（`releases/ShotX-0.1.2.app.zip` / `ShotX-0.1.2-source.zip`） |
+| 交付版本 | ShotX 0.1.3（BRA-71 变更单 + BRA-76 修复 + BRA-79 截图闪退修复与 Figma 录屏 UI） |
+| 交付基线 | 分支 `agent/bra-79-recording-ui`（基于 `agent/bra-76-fixes @ ff7038f`） |
+| 包体附件 | BRA-79 重新打包（`releases/ShotX-0.1.3.app.zip` / `ShotX-0.1.3-source.zip`） |
 | 覆盖需求 | FR-BRA71-01…06（马赛克矩形对象、平滑自由画笔、对象就地选择移动、就地文字编辑、移除分享、录屏设置菜单中心锚定） |
 | 交付日期 | 2026-08-13 |
 | 手测用时预估 | 约 15 分钟 |
