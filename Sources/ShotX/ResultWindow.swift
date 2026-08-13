@@ -258,7 +258,7 @@ final class AnnotationView: NSView {
         }
         else if tool != .select {
             let shape = rect(start, end)
-            if tool == .mosaic && (shape.width < 4 || shape.height < 4) {
+            if tool == .mosaic && shape.width < 4 && shape.height < 4 {
                 // Tiny drags (both axes < 4 pt) do not create a mosaic object.
             } else {
                 remember(); annotations.append(.line(tool, start, end, color(for: tool), size(for: tool)))
@@ -406,7 +406,6 @@ final class AnnotationView: NSView {
             if tool == .mosaic { mosaic(rect: rect(start, end), size: width); return }
             color.setStroke(); let path = NSBezierPath(); path.lineWidth = width; path.lineCapStyle = .round
             if tool == .rectangle { path.appendRect(rect(start, end)) }
-            else if tool == .ellipse { path.appendOval(in: rect(start, end)) }
             else { path.move(to: start); path.line(to: end) }
             path.stroke()
             if tool == .arrow {
@@ -460,7 +459,7 @@ final class AnnotationView: NSView {
     private func bounds(of item: Annotation) -> CGRect {
         switch item {
         case .line(let tool, let a, let b, _, let width):
-            if tool == .rectangle || tool == .ellipse || tool == .mosaic { return rect(a, b) }
+            if tool == .rectangle || tool == .mosaic { return rect(a, b) }
             return rect(a, b).insetBy(dx: -max(4, width), dy: -max(4, width))
         case .path(let points, _, let width):
             guard let first = points.first else { return .zero }
@@ -472,7 +471,7 @@ final class AnnotationView: NSView {
     private func hitTest(_ point: CGPoint, annotation: Annotation) -> Bool {
         switch annotation {
         case .line(let tool, let a, let b, _, let width):
-            if tool == .rectangle || tool == .ellipse || tool == .mosaic { return rect(a, b).insetBy(dx: -4, dy: -4).contains(point) }
+            if tool == .rectangle || tool == .mosaic { return rect(a, b).insetBy(dx: -4, dy: -4).contains(point) }
             return AnnotationMath.distance(toSegment: point, a: a, b: b) <= max(width / 2, 8)
         case .path(let points, _, let width):
             return AnnotationMath.distance(toPath: point, points: points) <= max(width / 2, 8)
@@ -494,10 +493,14 @@ final class AnnotationView: NSView {
 
     private func beginTextEditing(at point: CGPoint? = nil, existingIndex: Int? = nil) {
         commitTextEditingIfActive()
-        let color = color(for: .text)
-        let size = size(for: .text)
-        let font = NSFont.systemFont(ofSize: size, weight: .semibold)
         let existing = existingIndex.flatMap { index in annotations.indices.contains(index) ? annotations[index] : nil }
+        let stored: (NSColor, CGFloat)? = {
+            if case .text(_, _, let c, let s)? = existing { return (c, s) }
+            return nil
+        }()
+        let color = stored?.0 ?? color(for: .text)
+        let size = stored?.1 ?? size(for: .text)
+        let font = NSFont.systemFont(ofSize: size, weight: .semibold)
         let text = { if case .text(let string, _, _, _)? = existing { string } else { "" } }()
         let origin = { if case .text(_, let origin, _, _)? = existing { origin } else { point ?? .zero } }()
 
@@ -532,8 +535,8 @@ final class AnnotationView: NSView {
 
     private func commitTextEditing() {
         guard let editor = textEditor else { return }
-        let color = color(for: .text)
-        let size = size(for: .text)
+        let color = editor.textColor ?? color(for: .text)
+        let size = editor.font?.pointSize ?? size(for: .text)
         let point = textEditorAnchor
         let string = editor.string
         let index = textEditingIndex

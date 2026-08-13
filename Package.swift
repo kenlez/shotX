@@ -9,6 +9,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "ShotX",
+            resources: [.process("Assets")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(name: "ShotXTests", dependencies: ["ShotX"])

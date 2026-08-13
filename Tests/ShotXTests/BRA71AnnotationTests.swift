@@ -36,6 +36,17 @@ final class BRA71AnnotationTests: XCTestCase {
         XCTAssertTrue(view.stateSnapshot.annotations.isEmpty)
     }
 
+    @MainActor
+    func testMosaicThinStripIsKept() {
+        let view = AnnotationView(image: makeImage(), settings: .defaults)
+        view.tool = .mosaic
+        view.mouseDown(with: mouseEvent(.leftMouseDown, at: CGPoint(x: 10, y: 10), in: view))
+        view.mouseDragged(with: mouseEvent(.leftMouseDragged, at: CGPoint(x: 13, y: 60), in: view))
+        view.mouseUp(with: mouseEvent(.leftMouseUp, at: CGPoint(x: 13, y: 60), in: view))
+        guard case .line(.mosaic, let a, let b, _, _)? = view.stateSnapshot.annotations.first else { return XCTFail("expected thin mosaic strip preserved") }
+        XCTAssertEqual(CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y)), CGRect(x: 10, y: 10, width: 3, height: 50))
+    }
+
     func testMosaicStyleLabelUsesBlockSize() {
         XCTAssertEqual(AnnotationTool.mosaic.styleLabel, "块大小")
         XCTAssertEqual(AnnotationTool.mosaic.styleRange.presets, [8, 16, 24, 40])
@@ -171,6 +182,32 @@ final class BRA71AnnotationTests: XCTestCase {
         view.commitTextEditingIfActive()
         guard case .text(let text, _, _, _)? = view.stateSnapshot.annotations.first else { return XCTFail("expected text annotation") }
         XCTAssertEqual(text, "终稿")
+    }
+
+    @MainActor
+    func testDoubleClickReentryPreservesStoredColorAndSize() {
+        let view = AnnotationView(image: makeImage(), settings: .defaults)
+        view.tool = .text
+        view.mouseDown(with: mouseEvent(.leftMouseDown, at: CGPoint(x: 20, y: 20), in: view))
+        guard let editor = view.subviews.compactMap({ $0 as? NSTextView }).first else { return XCTFail("expected inline text editor") }
+        editor.string = "保持"
+        view.commitTextEditingIfActive()
+
+        view.tool = .select
+        view.mouseDown(with: mouseEvent(.leftMouseDown, at: CGPoint(x: 150, y: 100), in: view))
+        view.mouseUp(with: mouseEvent(.leftMouseUp, at: CGPoint(x: 150, y: 100), in: view))
+        view.applyStyleLive(color: .systemBlue, size: 24)
+
+        view.mouseDown(with: mouseEvent(.leftMouseDown, at: CGPoint(x: 20, y: 20), in: view, clickCount: 2))
+        guard let re = view.subviews.compactMap({ $0 as? NSTextView }).first else { return XCTFail("expected re-entered editor") }
+        XCTAssertEqual(re.string, "保持")
+        XCTAssertEqual(re.textColor?.hex, "#FF3B30")
+        XCTAssertEqual(re.font?.pointSize, 16)
+        re.string = "保持二"
+        view.commitTextEditingIfActive()
+        guard case .text(_, _, let color, let size)? = view.stateSnapshot.annotations.first else { return XCTFail("expected text annotation") }
+        XCTAssertEqual(color.hex, "#FF3B30")
+        XCTAssertEqual(size, 16)
     }
 
     @MainActor

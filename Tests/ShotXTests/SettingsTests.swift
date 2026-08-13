@@ -3,9 +3,10 @@ import XCTest
 @testable import ShotX
 
 final class SettingsTests: XCTestCase {
-    func testAnnotationToolsIncludeFigmaShapeTools() {
-        XCTAssertTrue(AnnotationTool.allCases.contains(.ellipse))
-        XCTAssertTrue(AnnotationTool.allCases.contains(.line))
+    func testAnnotationToolSetMatchesOriginalFigmaTools() {
+        XCTAssertEqual(AnnotationTool.allCases, [.select, .arrow, .rectangle, .pen, .text, .mosaic, .crop])
+        XCTAssertEqual(AnnotationTool.allCases.map(\.rawValue), ["选择", "箭头", "矩形", "画笔", "文字", "马赛克", "裁剪"])
+        XCTAssertEqual(AnnotationTool.styledCases, [.arrow, .rectangle, .pen, .text, .mosaic])
     }
 
     func testDefaultsRoundTripAndConflictRules() throws {

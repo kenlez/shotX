@@ -35,6 +35,7 @@ app: icons
 	cp .build/release/$(APP_NAME) $(APP_NAME).app/Contents/MacOS/$(APP_NAME)
 	cp Support/Info.plist $(APP_NAME).app/Contents/Info.plist
 	cp $(ICON_ICNS) $(APP_NAME).app/Contents/Resources/$(APP_NAME).icns
+	cp -R .build/release/ShotX_ShotX.bundle $(APP_NAME).app/Contents/Resources/
 	/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(VERSION)" $(APP_NAME).app/Contents/Info.plist
 	/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(VERSION)" $(APP_NAME).app/Contents/Info.plist
 	codesign --force --deep --sign - $(APP_NAME).app
