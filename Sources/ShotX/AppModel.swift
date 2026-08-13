@@ -78,9 +78,9 @@ struct AppSettings: Codable, Equatable {
 }
 
 enum AnnotationTool: String, CaseIterable, Identifiable {
-    case select = "选择", arrow = "箭头", rectangle = "矩形", pen = "画笔", text = "文字", mosaic = "马赛克", crop = "裁剪"
+    case select = "选择", rectangle = "矩形", ellipse = "椭圆", line = "直线", arrow = "箭头", pen = "画笔", mosaic = "马赛克", text = "文字", crop = "裁剪"
     var id: String { rawValue }
-    static let styledCases: [AnnotationTool] = [.arrow, .rectangle, .pen, .text, .mosaic]
+    static let styledCases: [AnnotationTool] = [.arrow, .rectangle, .ellipse, .line, .pen, .text, .mosaic]
 
     /// Continuous draggable brush range and discrete preset values for the tool options popover (FR-CAP-15/16).
     var styleRange: (min: Double, max: Double, presets: [Double], unit: String) {
@@ -95,7 +95,7 @@ enum AnnotationTool: String, CaseIterable, Identifiable {
     var styleLabel: String {
         switch self {
         case .text: "字号"
-        case .mosaic: "笔刷大小"
+        case .mosaic: "块大小"
         default: "粗细"
         }
     }

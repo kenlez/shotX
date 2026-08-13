@@ -56,3 +56,20 @@ QA 复测闭环（BRA-48，2026-08-12）：
 - 静默冒烟启动 → 进程启动后存活、退出干净
 - 静态检查 → 无网络代码；无摄像头捕获残留
 - 桌面交互（固定元素集、工具选项浮层展开/避让/关闭、可拖拽笔刷大小实时生效与记忆、VoiceOver/键盘可达）归用户手测，随 `ShotX.app.zip` + 手测清单交付
+
+## BRA-71 交付（FR-BRA71-01…06）
+
+| FR | Implementation | Development evidence |
+| --- | --- | --- |
+| FR-BRA71-01 | 马赛克改为矩形对象：`AnnotationView.mosaic(rect:size:)` 填充整块矩形像素化；样式标签「笔刷大小」→「块大小」；两轴 < 4 pt 拖拽丢弃；对象就地保留、可选择/拖动/删除/撤销 | `testMosaicDragCreatesRectangularObject`、`testMosaicTinyDragIsDiscarded`、`testMosaicStyleLabelUsesBlockSize` |
+| FR-BRA71-02 | 画笔新增 `Annotation.path` 对象：拖动期间逐事件采样点，`AnnotationMath.smoothPath`（Catmull-Rom→三次贝塞尔）渲染平滑曲线；总长 < 2 pt 提交圆点；命中测试按到路径距离 ≤ max(粗细/2, 8) pt，不退化包围盒 | `testPenFollowsMouseWithSmoothPath`、`testPenClickBecomesDot`、`testSmoothPathUsesBezierCurvesNotStraightLines`、`testPathHitTestUsesDistanceNotBoundingBox` |
+| FR-BRA71-03 | 所有对象就地呈现并复用选择/移动/方向键/Delete/历史栈；直线/箭头/路径按距离命中 | `testSelectedPathMovesWithDrag`、`testClickFarFromStrokeDoesNotMoveIt` |
+| FR-BRA71-04 | 文字改为画布内就地编辑：单击创建 `InlineTextView`（无 `NSAlert`），Return/Esc/点击外部提交，双击文字重入编辑，空文字提交删除，编辑中样式即时反映 | `testTextCommitsInlineWithoutModalAndIsSelectable`、`testDoubleClickReentersTextEditing`、`testEmptyTextCommitCreatesNothingAndEmptyEditDeletes`、`testTextObjectDragMovesWithoutEnteringEdit` |
+| FR-BRA71-05 | 移除系统分享：`ResultWindow` 分享按钮与 `NSSharingServicePicker` 调用、`CaptureCoordinator` `sharePressed`/`pendingShareImage`/picker delegate 全部删除；菜单栏无分享入口；工具栏输出行为 复制/保存/贴图/关闭 | 静态检查无 `NSSharingServicePicker`/分享引用；`swift test` 通过 |
+| FR-BRA71-06 | 录屏设置菜单中心锚定：`RecordingSetupLayout.frame` 默认菜单中心 = 选区中心并随选区变化重锚定；选区任一向小于面板或溢出可见区时按 下→上→侧边 避让链，最后贴边钳制；「开始录制」后面板隐藏且不进入成片 | `testRecordingSetupPanelCentersOnLargeSelection`、`testRecordingSetupPanelAvoidsTinySelectionBelow`、`testRecordingSetupPanelTallSelectionKeepsHorizontalCenter`、`testRecordingSetupPanelFallsBackInsideVisibleFrame` |
+
+后台自测闭环（BRA-73 交付运行结果）：
+
+- `swift test`（clean）→ 55/55 通过，0 failures（新增 `BRA71AnnotationTests` 17 例；`testLiveAnnotationStyleDrivesNextStrokeAndRestores` 随画笔对象模型更新为 `.path` 断言）
+- 静态检查 → 源码无 `NSSharingServicePicker`、`sharePressed`、`shareImage`、`pendingShareImage` 残留
+- 桌面交互（马赛克矩形预览、自由画笔手感、文字就地编辑、双击重入、录屏菜单中心跟随）归用户手测，随 `ShotX.app.zip` + 手测清单交付

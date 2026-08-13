@@ -67,6 +67,51 @@ enum RecordingOutputSize {
     }
 }
 
+/// FR-BRA71-06: anchors the recording setup panel to the selection center and follows selection
+/// changes; when centering would cover every corner handle (or overflow the visible frame) the
+/// panel falls back to the avoidance chain below → above → sides, then edge-clamping.
+/// Coordinates are in the same space as `selection` (screen-local, y-up); `visibleFrame` is the
+/// screen's visible frame in the same space.
+enum RecordingSetupLayout {
+    static let edge: CGFloat = 8
+    static let cornerHotspot: CGFloat = 20
+
+    static func frame(panelSize: CGSize, selection: CGRect, visibleFrame: CGRect) -> CGRect {
+        func fits(_ rect: CGRect) -> Bool { visibleFrame.contains(rect) }
+        func coversAllCorners(_ rect: CGRect) -> Bool {
+            let half = cornerHotspot / 2
+            let corners = [
+                CGPoint(x: selection.minX, y: selection.minY),
+                CGPoint(x: selection.maxX, y: selection.minY),
+                CGPoint(x: selection.minX, y: selection.maxY),
+                CGPoint(x: selection.maxX, y: selection.maxY)
+            ]
+            return corners.allSatisfy { rect.insetBy(dx: -half, dy: -half).contains($0) }
+        }
+        func clamped(_ rect: CGRect) -> CGRect {
+            let x = min(max(visibleFrame.minX, rect.minX), max(visibleFrame.minX, visibleFrame.maxX - rect.width))
+            let y = min(max(visibleFrame.minY, rect.minY), max(visibleFrame.minY, visibleFrame.maxY - rect.height))
+            return CGRect(x: x, y: y, width: rect.width, height: rect.height)
+        }
+        guard panelSize.width > 0, panelSize.height > 0 else { return clamped(CGRect(origin: selection.origin, size: panelSize)) }
+
+        let centered = CGRect(x: selection.midX - panelSize.width / 2, y: selection.midY - panelSize.height / 2, width: panelSize.width, height: panelSize.height)
+        // Center only when the selection is strictly larger than the panel on both axes, the
+        // centered frame fits the visible work area, and no corner handle is fully covered.
+        let largeEnough = selection.width > panelSize.width && selection.height > panelSize.height
+        if largeEnough, fits(centered), !coversAllCorners(centered) { return centered }
+
+        let candidates = [
+            CGRect(x: selection.midX - panelSize.width / 2, y: selection.minY - edge - panelSize.height, width: panelSize.width, height: panelSize.height),
+            CGRect(x: selection.midX - panelSize.width / 2, y: selection.maxY + edge, width: panelSize.width, height: panelSize.height),
+            CGRect(x: selection.maxX + edge, y: selection.midY - panelSize.height / 2, width: panelSize.width, height: panelSize.height),
+            CGRect(x: selection.minX - edge - panelSize.width, y: selection.midY - panelSize.height / 2, width: panelSize.width, height: panelSize.height)
+        ]
+        if let fit = candidates.first(where: fits) { return fit }
+        return clamped(centered)
+    }
+}
+
 enum RecoveryStore {
     static func directory(fileManager: FileManager = .default) throws -> URL {
         let support = try fileManager.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
@@ -129,6 +174,7 @@ final class RecordingCoordinator: NSObject {
         setup = RecordingSetupWindowController(model: model, screen: pending.screen, geometry: geometry, onStart: { [weak self] in self?.beginCountdown() }, onReturn: { [weak self] in self?.returnToSelection() })
         setup?.showWindow(nil)
         setup?.window?.makeKeyAndOrderFront(nil)
+        setup?.reposition()
     }
 
     private func updateSetupGeometry(_ rect: CGRect) {
@@ -535,11 +581,9 @@ private final class RecordingSetupWindowController: NSWindowController {
     func reposition() {
         guard let window else { return }
         let selection = geometry.selection
-        let below = screen.frame.minY + selection.minY - window.frame.height - 8
-        let above = screen.frame.minY + selection.maxY + 8
-        let y = below >= screen.visibleFrame.minY ? below : min(above, screen.visibleFrame.maxY - window.frame.height)
-        let x = min(max(screen.frame.minX + selection.midX - window.frame.width / 2, screen.visibleFrame.minX), screen.visibleFrame.maxX - window.frame.width)
-        window.setFrameOrigin(NSPoint(x: x, y: max(screen.visibleFrame.minY, y)))
+        let visible = screen.visibleFrame.offsetBy(dx: -screen.frame.minX, dy: -screen.frame.minY)
+        let frame = RecordingSetupLayout.frame(panelSize: window.frame.size, selection: selection, visibleFrame: visible)
+        window.setFrameOrigin(NSPoint(x: screen.frame.minX + frame.minX, y: screen.frame.minY + frame.minY))
     }
 }
 

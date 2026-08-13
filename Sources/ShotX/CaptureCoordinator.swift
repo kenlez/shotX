@@ -344,11 +344,9 @@ final class SelectionView: NSView {
     private weak var model: AppModel?
     private var editor: AnnotationView?
     private var toolbar: NSVisualEffectView?
-    private var toolControl: NSSegmentedControl?
     private var toolbarFixedSize = NSSize.zero
     private var optionsContentHeight: CGFloat = 120
     private var lastToolIndex = 0
-    private let styleButton = NSButton(frame: .zero)
     private var optionsPanel: NSPanel?
     private var optionsMonitor: Any?
     private var optionsKeyMonitor: Any?
@@ -373,7 +371,11 @@ final class SelectionView: NSView {
     private var dragOrigin = CGPoint.zero
     private var undoStack: [RegionEditSnapshot] = []
     private var redoStack: [RegionEditSnapshot] = []
-    private var pendingShareImage: NSImage?
+
+    private static func figmaImage(_ name: String) -> NSImage? {
+        let url = Bundle.module.url(forResource: name, withExtension: "svg", subdirectory: "Figma") ?? Bundle.module.url(forResource: name, withExtension: "svg")
+        return url.flatMap(NSImage.init(contentsOf:))
+    }
 
     init(frame: CGRect, mode: CaptureMode, screen: NSScreen, windows: [SCWindow], frozenImage: CGImage? = nil, model: AppModel? = nil) {
         self.mode = mode
@@ -515,14 +517,27 @@ final class SelectionView: NSView {
             if setupActive {
                 drawSetupBorder(around: focus)
             } else {
-                NSColor.controlAccentColor.setStroke()
-                let path = NSBezierPath(rect: focus)
-                path.lineWidth = mode.isDisplay ? 3 : 2
-                path.stroke()
+                drawFigmaSelectionBorder(around: focus)
             }
             if (mode == .region || mode == .regionRecording), phase == .editing { drawHandles(around: focus) }
         }
         drawLabel(focus: focus)
+    }
+
+    private func drawFigmaSelectionBorder(around rect: CGRect) {
+        let blue = NSColor(hex: "#10AEFF") ?? .systemBlue
+        blue.setStroke()
+        let frame = NSBezierPath(roundedRect: rect.insetBy(dx: 1.5, dy: 1.5), xRadius: 3, yRadius: 3)
+        frame.lineWidth = 3
+        frame.stroke()
+        for (x, y, sx, sy) in [(rect.minX, rect.minY, 1.0, 1.0), (rect.maxX, rect.minY, -1, 1), (rect.minX, rect.maxY, 1, -1), (rect.maxX, rect.maxY, -1, -1)] {
+            let corner = NSBezierPath()
+            corner.move(to: CGPoint(x: x + 22 * sx, y: y))
+            corner.line(to: CGPoint(x: x, y: y))
+            corner.line(to: CGPoint(x: x, y: y + 22 * sy))
+            corner.lineWidth = 3
+            corner.stroke()
+        }
     }
 
     private func drawSetupBorder(around rect: CGRect) {
@@ -593,37 +608,28 @@ final class SelectionView: NSView {
     }
 
     private func makeToolbar() {
-        let tools = NSSegmentedControl(labels: AnnotationTool.allCases.map(\.rawValue), trackingMode: .selectOne, target: self, action: #selector(toolChanged(_:)))
-        tools.selectedSegment = 0
-        tools.controlSize = .small
-        for index in 0..<tools.segmentCount { tools.setWidth(32, forSegment: index) }
-        toolControl = tools
-        styleButton.target = self; styleButton.action = #selector(stylePressed); styleButton.setAccessibilityLabel("样式"); styleButton.toolTip = "样式"
-        styleButton.controlSize = .small
-        styleButton.widthAnchor.constraint(equalToConstant: 72).isActive = true
-        let undo = button("撤销", #selector(undoPressed)); undo.controlSize = .small
-        let redo = button("重做", #selector(redoPressed)); redo.controlSize = .small
-        let editButtons = [tools, undo, redo, styleButton]
-        let outputButtons = [button("复制", #selector(copyPressed)), button("保存…", #selector(savePressed)), button("分享…", #selector(sharePressed)), button("贴图", #selector(pinPressed)), button("关闭", #selector(closePressed))]
-        toolbarControls = [tools, undo, redo, styleButton]
-        outputControls = outputButtons
-        outputButtons.forEach { $0.controlSize = .small }
-        let toolRow = NSStackView(views: editButtons); toolRow.orientation = .horizontal; toolRow.spacing = 4; toolRow.alignment = .centerY
-        let outputRow = NSStackView(views: outputButtons); outputRow.orientation = .horizontal; outputRow.spacing = 4; outputRow.alignment = .centerY
-        let toolbar = NSVisualEffectView(frame: .zero); toolbar.material = .hudWindow; toolbar.state = .active; toolbar.wantsLayer = true; toolbar.layer?.cornerRadius = 10
-        let content = NSStackView(views: [toolRow, outputRow])
-        content.spacing = 4; content.alignment = .centerY
-        let twoLines = CaptureOverlayLayout.toolbarUsesTwoLines(fixedWidth: toolRow.fittingSize.width + outputRow.fittingSize.width + 7 + 20, visibleWidth: targetScreen.visibleFrame.width)
-        content.orientation = twoLines ? .vertical : .horizontal
+        let tools = ["rectangle", "circle", "line", "arrow", "pen", "mosaic", "text", "annotation"].enumerated().map { index, icon in
+            figmaButton(icon, action: #selector(toolPressed(_:)), tag: index, label: AnnotationTool.allCases[index + 1].rawValue)
+        }
+        let undo = figmaButton("undo", action: #selector(undoPressed), label: "撤销")
+        let close = figmaButton("close", action: #selector(closePressed), label: "关闭")
+        let longShot = figmaButton("long-shot", action: #selector(stylePressed), label: "样式")
+        let pin = figmaButton("pin", action: #selector(pinPressed), label: "贴图")
+        let save = figmaButton("save", action: #selector(savePressed), label: "保存")
+        let copy = figmaButton("copy", action: #selector(copyPressed), label: "复制")
+        toolbarControls = tools + [undo, close, longShot]
+        outputControls = [pin, save, copy]
+        let divider = { () -> NSView in let view = NSView(frame: NSRect(x: 0, y: 0, width: 1, height: 12)); view.wantsLayer = true; view.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.28).cgColor; return view }
+        let content = NSStackView(views: tools + [divider(), undo, close, divider(), longShot, divider(), pin, save, copy])
+        content.orientation = .horizontal; content.spacing = 16; content.alignment = .centerY
+        let toolbar = NSVisualEffectView(frame: .zero); toolbar.material = .hudWindow; toolbar.state = .active; toolbar.wantsLayer = true; toolbar.layer?.cornerRadius = 12; toolbar.layer?.backgroundColor = NSColor(hex: "#333333")?.cgColor
         toolbar.addSubview(content)
         content.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([content.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 10), content.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -10), content.topAnchor.constraint(equalTo: toolbar.topAnchor, constant: 4), content.bottomAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: -4)])
+        NSLayoutConstraint.activate([content.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 18), content.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -18), content.topAnchor.constraint(equalTo: toolbar.topAnchor, constant: 12), content.bottomAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: -12)])
         toolbar.layoutSubtreeIfNeeded()
         updateStyleControls(for: .select)
-        toolbar.layoutSubtreeIfNeeded()
         let visible = targetScreen.visibleFrame.offsetBy(dx: -targetScreen.frame.minX, dy: -targetScreen.frame.minY)
-        toolbarFixedSize = CaptureOverlayLayout.toolbarSize(toolbar.fittingSize, visibleFrame: visible)
-        toolbarFixedSize.height = twoLines ? 80 : 40
+        toolbarFixedSize = CaptureOverlayLayout.toolbarSize(NSSize(width: 600, height: 46), visibleFrame: visible)
         addSubview(toolbar); self.toolbar = toolbar
         positionToolbar()
         updateFocusChain()
@@ -716,9 +722,26 @@ final class SelectionView: NSView {
 
     private func button(_ title: String, _ action: Selector) -> NSButton { NSButton(title: title, target: self, action: action) }
 
+    private func figmaButton(_ imageName: String, action: Selector, tag: Int = 0, label: String) -> NSButton {
+        let button = NSButton(image: Self.figmaImage(imageName) ?? NSImage(), target: self, action: action)
+        button.imagePosition = .imageOnly; button.isBordered = false; button.tag = tag; button.setAccessibilityLabel(label); button.toolTip = label
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([button.widthAnchor.constraint(equalToConstant: 22), button.heightAnchor.constraint(equalToConstant: 22)])
+        return button
+    }
+
+    @objc private func toolPressed(_ sender: NSButton) {
+        let index = sender.tag + 1
+        guard AnnotationTool.allCases.indices.contains(index) else { return }
+        selectTool(AnnotationTool.allCases[index], index: index)
+    }
+
     @objc private func toolChanged(_ sender: NSSegmentedControl) {
         let index = sender.selectedSegment
-        let tool = AnnotationTool.allCases[index]
+        selectTool(AnnotationTool.allCases[index], index: index)
+    }
+
+    private func selectTool(_ tool: AnnotationTool, index: Int) {
         if index == lastToolIndex, AnnotationTool.styledCases.contains(tool), optionsPanel?.isVisible == true {
             hideOptionsPanel()
             return
@@ -741,7 +764,8 @@ final class SelectionView: NSView {
 
     private func showOptionsPanel() {
         hideOptionsPanel()
-        let panel = OptionsPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 220), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let width: CGFloat = editor?.tool == .text ? 192 : 144
+        let panel = OptionsPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: 52), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
         panel.level = .screenSaver
         panel.backgroundColor = .clear
@@ -750,7 +774,7 @@ final class SelectionView: NSView {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         let content = makeOptionsContent()
         panel.contentView = content
-        panel.setContentSize(CaptureOverlayLayout.optionsPanelSize(contentHeight: optionsContentHeight, visibleFrame: targetScreen.visibleFrame))
+        panel.setContentSize(NSSize(width: width, height: 52))
         optionsPanel = panel
         positionOptionsPanel()
         panel.makeKeyAndOrderFront(nil)
@@ -764,7 +788,7 @@ final class SelectionView: NSView {
         guard let panel = optionsPanel else { return }
         let content = makeOptionsContent()
         panel.contentView = content
-        panel.setContentSize(CaptureOverlayLayout.optionsPanelSize(contentHeight: optionsContentHeight, visibleFrame: targetScreen.visibleFrame))
+        panel.setContentSize(NSSize(width: editor?.tool == .text ? 192 : 144, height: 52))
         positionOptionsPanel()
         updateFocusChain()
     }
@@ -778,7 +802,7 @@ final class SelectionView: NSView {
         optionsPanel = nil
         updateFocusChain()
         window?.makeKey()
-        window?.makeFirstResponder(styleButton)
+        window?.makeFirstResponder(editor)
     }
 
     private func installOptionsMonitors() {
@@ -800,23 +824,40 @@ final class SelectionView: NSView {
     private func makeOptionsContent() -> NSView {
         guard let tool = editor?.tool else { return NSView() }
         optionsControls = []
-        let content = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 300, height: 220))
-        content.material = .hudWindow; content.state = .active; content.wantsLayer = true; content.layer?.cornerRadius = 10
-        var sections: [NSView] = [makeMemoryRow(for: tool)]
-        if tool != .mosaic { sections.append(makeColorSection()) }
-        sections.append(makeSizeSection(for: tool))
-        let root = NSStackView(views: sections)
-        root.orientation = .vertical; root.spacing = 8; root.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
-        root.layoutSubtreeIfNeeded()
-        root.frame = NSRect(origin: .zero, size: NSSize(width: CaptureOverlayLayout.optionsWidth - 20, height: root.fittingSize.height))
-        optionsContentHeight = root.frame.height + 20
-        let scroll = NSScrollView()
-        scroll.documentView = root; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(scroll)
-        NSLayoutConstraint.activate([scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10), scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10), scroll.topAnchor.constraint(equalTo: content.topAnchor, constant: 10), scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10)])
+        let isText = tool == .text
+        let width: CGFloat = isText ? 192 : 144
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 52))
+        content.wantsLayer = true; content.layer?.cornerRadius = 26; content.layer?.backgroundColor = NSColor(hex: "#333333")?.cgColor; content.layer?.shadowColor = NSColor.black.cgColor; content.layer?.shadowOpacity = 0.16; content.layer?.shadowRadius = 8; content.layer?.shadowOffset = NSSize(width: 0, height: 4)
+        let size = NSButton(title: "", target: self, action: #selector(sizeDotPressed))
+        size.isBordered = false; size.frame = NSRect(x: 12, y: 10, width: 32, height: 32); size.wantsLayer = true; size.layer?.cornerRadius = 16; size.layer?.borderWidth = 1; size.layer?.borderColor = NSColor.white.withAlphaComponent(0.4).cgColor
+        let diameter = max(5, min(20, CGFloat(currentSize(for: tool))))
+        let dot = NSView(frame: NSRect(x: (32 - diameter) / 2, y: (32 - diameter) / 2, width: diameter, height: diameter)); dot.wantsLayer = true; dot.layer?.cornerRadius = diameter / 2; dot.layer?.backgroundColor = currentAnnotationColor.cgColor; size.addSubview(dot)
+        size.setAccessibilityLabel("\(tool.styleLabel) (Int(currentSize(for: tool))) (tool.styleRange.unit)"); optionsControls.append(size); content.addSubview(size)
+        let divider = NSView(frame: NSRect(x: 52, y: 20, width: 1, height: 12)); divider.wantsLayer = true; divider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.28).cgColor; content.addSubview(divider)
+        var x: CGFloat = 60
+        if isText {
+            let style = NSButton(title: "T", target: self, action: #selector(textStylePressed)); style.frame = NSRect(x: x, y: 10, width: 32, height: 32); style.isBordered = false; style.font = .systemFont(ofSize: 16, weight: .bold); style.contentTintColor = .white; style.setAccessibilityLabel("文字样式"); optionsControls.append(style); content.addSubview(style)
+            let textDivider = NSView(frame: NSRect(x: x + 40, y: 20, width: 1, height: 12)); textDivider.wantsLayer = true; textDivider.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.28).cgColor; content.addSubview(textDivider); x += 48
+        }
+        if !isText && tool != .mosaic {
+            for (index, color) in Self.presetColors.enumerated() {
+                let button = NSButton(title: "", target: self, action: #selector(presetPicked(_:)))
+                button.tag = index; button.isBordered = false; button.frame = NSRect(x: x + CGFloat(index % 3) * 25, y: 26 - CGFloat(index / 3) * 22, width: 22, height: 22); button.wantsLayer = true; button.layer?.cornerRadius = 11; button.layer?.backgroundColor = color.cgColor; button.layer?.borderWidth = color.hex == currentAnnotationColor.hex ? 3 : 1; button.layer?.borderColor = (color.hex == currentAnnotationColor.hex ? NSColor.white : NSColor.white.withAlphaComponent(0.4)).cgColor; button.setAccessibilityLabel("预设颜色 \(color.hex)"); optionsControls.append(button); content.addSubview(button)
+            }
+        }
+        optionsContentHeight = 52
         return content
     }
+
+    @objc private func sizeDotPressed() {
+        guard let editor, let model else { return }
+        let tool = editor.tool, values = tool.styleRange.presets
+        guard let index = values.firstIndex(of: currentSize(for: tool)), !values.isEmpty else { return }
+        let value = values[(index + 1) % values.count]
+        editor.applyStyle(color: currentAnnotationColor, size: value); model.settings.annotationSizes[tool.rawValue] = value; model.persist(); rebuildOptionsPanel(); updateStyleButton()
+    }
+
+    @objc private func textStylePressed() { NSSound.beep() }
 
     private func makeMemoryRow(for tool: AnnotationTool) -> NSView {
         let label = NSTextField(labelWithString: "")
@@ -1102,11 +1143,6 @@ final class SelectionView: NSView {
             catch { model?.showError("保存失败。结果仍保留，请重试或另存为。") }
         }
     }
-    @objc private func sharePressed() {
-        guard let image = renderOutput(), let toolbar else { return }
-        pendingShareImage = image
-        let picker = NSSharingServicePicker(items: [image]); picker.delegate = self; picker.show(relativeTo: toolbar.bounds, of: toolbar, preferredEdge: .minY)
-    }
     @objc private func pinPressed() { guard let image = renderOutput() else { return }; PinWindowController.show(image); commit(image) }
     private func renderOutput() -> NSImage? { hideOptionsPanel(); return editor?.render() }
     private func commit(_ image: NSImage) { phase.commit(); onCommit?(image) }
@@ -1117,25 +1153,7 @@ final class SelectionView: NSView {
         updateColorButtons()
         updateMemoryLabel(for: tool)
     }
-    private func updateStyleButton() {
-        guard let tool = editor?.tool else { return }
-        let styled = AnnotationTool.styledCases.contains(tool)
-        styleButton.isEnabled = styled
-        if styled {
-            let size = currentSize(for: tool)
-            let summary = tool == .mosaic ? "\(Int(size)) px" : "\(Int(size)) pt"
-            styleButton.image = tool == .mosaic ? nil : Self.swatchImage(currentAnnotationColor, size: NSSize(width: 18, height: 13))
-            styleButton.imagePosition = tool == .mosaic ? .noImage : .imageLeading
-            styleButton.title = summary
-            styleButton.toolTip = "样式 · \(summary)"
-        } else {
-            styleButton.image = nil
-            styleButton.imagePosition = .noImage
-            styleButton.title = "样式"
-            styleButton.toolTip = "该工具无样式选项"
-        }
-        styleButton.setAccessibilityLabel("样式 \(styleButton.title)")
-    }
+    private func updateStyleButton() {}
     private func updateColorButtons() {
         for (index, button) in swatchButtons.enumerated() where index < Self.presetColors.count {
             let color = Self.presetColors[index]
@@ -1156,7 +1174,7 @@ final class SelectionView: NSView {
         let raw = editor?.styleSize(for: tool) ?? model?.settings.annotationSizes[tool.rawValue] ?? AnnotationTool.defaultSize(for: tool)
         return min(max(range.min, raw), max(range.min, range.max))
     }
-    private static let presetColors: [NSColor] = ["#FF3B30", "#FF9500", "#FFCC00", "#34C759", "#5AC8FA", "#007AFF", "#AF52DE", "#FF2D55", "#A2845E", "#8E8E93", "#FFFFFF", "#000000"].compactMap { NSColor(hex: $0) }
+    private static let presetColors: [NSColor] = ["#FA5151", "#000000", "#FFFFFF", "#10AEFF", "#34A853", "#FFC300"].compactMap { NSColor(hex: $0) }
     private static func swatchImage(_ color: NSColor, size: NSSize, selected: Bool = false) -> NSImage {
         let image = NSImage(size: size)
         image.lockFocus()
@@ -1282,13 +1300,6 @@ private final class EyeDropperPreviewView: NSView {
             colorLabel.stringValue = "■"
             hexLabel.stringValue = String(format: "#%02X%02X%02X", Int(device.redComponent * 255), Int(device.greenComponent * 255), Int(device.blueComponent * 255))
         }
-    }
-}
-
-extension SelectionView: NSSharingServicePickerDelegate {
-    func sharingServicePicker(_ sharingServicePicker: NSSharingServicePicker, didChoose service: NSSharingService?) {
-        guard service != nil, let image = pendingShareImage else { pendingShareImage = nil; return }
-        pendingShareImage = nil; commit(image)
     }
 }
 

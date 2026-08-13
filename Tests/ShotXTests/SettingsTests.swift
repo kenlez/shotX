@@ -3,6 +3,11 @@ import XCTest
 @testable import ShotX
 
 final class SettingsTests: XCTestCase {
+    func testAnnotationToolsIncludeFigmaShapeTools() {
+        XCTAssertTrue(AnnotationTool.allCases.contains(.ellipse))
+        XCTAssertTrue(AnnotationTool.allCases.contains(.line))
+    }
+
     func testDefaultsRoundTripAndConflictRules() throws {
         let data = try JSONEncoder().encode(AppSettings.defaults)
         XCTAssertEqual(try JSONDecoder().decode(AppSettings.self, from: data), .defaults)
@@ -100,10 +105,12 @@ final class SettingsTests: XCTestCase {
         view.tool = .pen
         view.applyStyleLive(color: .systemBlue, size: 7)
         let down = NSEvent.mouseEvent(with: .leftMouseDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+        let drag = NSEvent.mouseEvent(with: .leftMouseDragged, location: CGPoint(x: 5, y: 5), modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
         let up = NSEvent.mouseEvent(with: .leftMouseUp, location: CGPoint(x: 5, y: 5), modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 0)!
-        view.mouseDown(with: down); view.mouseUp(with: up)
-        guard case .line(_, _, _, _, let size)? = view.stateSnapshot.annotations.last else { return XCTFail("Expected stroke") }
+        view.mouseDown(with: down); view.mouseDragged(with: drag); view.mouseUp(with: up)
+        guard case .path(let points, _, let size)? = view.stateSnapshot.annotations.last else { return XCTFail("Expected smooth path stroke") }
         XCTAssertEqual(size, 7)
+        XCTAssertGreaterThanOrEqual(points.count, 2)
 
         var settings = AppSettings.defaults
         settings.annotationSizes[AnnotationTool.pen.rawValue] = 7
