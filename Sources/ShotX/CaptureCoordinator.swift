@@ -234,6 +234,22 @@ final class CaptureCoordinator {
 
 private enum CaptureError: Error { case noContent }
 
+/// Resolves the SwiftPM resource bundle without crashing when the packaged
+/// `.app` places it under `Contents/Resources/` while the generated
+/// `Bundle.module` accessor only checks the bundle root and a build-machine
+/// path (`could not load resource bundle` → fatalError, SIGTRAP).
+enum FigmaResourceBundle {
+    static let bundleName = "ShotX_ShotX.bundle"
+
+    static func resolve(mainBundle: Bundle = .main) -> Bundle? {
+        let candidates = [
+            mainBundle.resourceURL?.appendingPathComponent(bundleName),
+            mainBundle.bundleURL.appendingPathComponent(bundleName)
+        ]
+        return candidates.compactMap { $0 }.compactMap { Bundle(url: $0) }.first
+    }
+}
+
 @MainActor
 final class SelectionWindowController: NSWindowController {
     var onCancel: (() -> Void)?
@@ -344,11 +360,9 @@ final class SelectionView: NSView {
     private weak var model: AppModel?
     private var editor: AnnotationView?
     private var toolbar: NSVisualEffectView?
-    private var toolControl: NSSegmentedControl?
     private var toolbarFixedSize = NSSize.zero
     private var optionsContentHeight: CGFloat = 120
     private var lastToolIndex = 0
-    private let styleButton = NSButton(frame: .zero)
     private var optionsPanel: NSPanel?
     private var optionsMonitor: Any?
     private var optionsKeyMonitor: Any?
@@ -373,7 +387,12 @@ final class SelectionView: NSView {
     private var dragOrigin = CGPoint.zero
     private var undoStack: [RegionEditSnapshot] = []
     private var redoStack: [RegionEditSnapshot] = []
-    private var pendingShareImage: NSImage?
+
+    private static func figmaImage(_ name: String) -> NSImage? {
+        guard let bundle = FigmaResourceBundle.resolve() else { return nil }
+        let url = bundle.url(forResource: name, withExtension: "svg", subdirectory: "Figma") ?? bundle.url(forResource: name, withExtension: "svg")
+        return url.flatMap(NSImage.init(contentsOf:))
+    }
 
     init(frame: CGRect, mode: CaptureMode, screen: NSScreen, windows: [SCWindow], frozenImage: CGImage? = nil, model: AppModel? = nil) {
         self.mode = mode
@@ -526,18 +545,10 @@ final class SelectionView: NSView {
     }
 
     private func drawSetupBorder(around rect: CGRect) {
-        NSColor.black.setStroke()
-        let outer = NSBezierPath(rect: rect.insetBy(dx: 0.5, dy: 0.5)); outer.lineWidth = 3; outer.stroke()
-        NSColor.white.setStroke()
-        let inner = NSBezierPath(rect: rect.insetBy(dx: 2, dy: 2)); inner.lineWidth = 2; inner.stroke()
-        for (x, y, sx, sy) in [(3.0, 3.0, 1.0, 1.0), (rect.maxX - 3, rect.minY + 3, -1, 1), (rect.minX + 3, rect.maxY - 3, 1, -1), (rect.maxX - 3, rect.maxY - 3, -1, -1)] {
-            let path = NSBezierPath()
-            path.move(to: CGPoint(x: x + 16 * sx, y: y))
-            path.line(to: CGPoint(x: x, y: y))
-            path.line(to: CGPoint(x: x, y: y + 16 * sy))
-            path.lineWidth = 3
-            path.stroke()
-        }
+        NSColor(calibratedRed: CGFloat(0x07) / 255, green: CGFloat(0xC1) / 255, blue: CGFloat(0x60) / 255, alpha: 1).setStroke()
+        let path = NSBezierPath(roundedRect: rect.insetBy(dx: 1.5, dy: 1.5), xRadius: 8, yRadius: 8)
+        path.lineWidth = 3
+        path.stroke()
     }
 
     private func drawLabel(focus: CGRect) {
@@ -593,37 +604,28 @@ final class SelectionView: NSView {
     }
 
     private func makeToolbar() {
-        let tools = NSSegmentedControl(labels: AnnotationTool.allCases.map(\.rawValue), trackingMode: .selectOne, target: self, action: #selector(toolChanged(_:)))
-        tools.selectedSegment = 0
-        tools.controlSize = .small
-        for index in 0..<tools.segmentCount { tools.setWidth(32, forSegment: index) }
-        toolControl = tools
-        styleButton.target = self; styleButton.action = #selector(stylePressed); styleButton.setAccessibilityLabel("样式"); styleButton.toolTip = "样式"
-        styleButton.controlSize = .small
-        styleButton.widthAnchor.constraint(equalToConstant: 72).isActive = true
-        let undo = button("撤销", #selector(undoPressed)); undo.controlSize = .small
-        let redo = button("重做", #selector(redoPressed)); redo.controlSize = .small
-        let editButtons = [tools, undo, redo, styleButton]
-        let outputButtons = [button("复制", #selector(copyPressed)), button("保存…", #selector(savePressed)), button("分享…", #selector(sharePressed)), button("贴图", #selector(pinPressed)), button("关闭", #selector(closePressed))]
-        toolbarControls = [tools, undo, redo, styleButton]
-        outputControls = outputButtons
-        outputButtons.forEach { $0.controlSize = .small }
-        let toolRow = NSStackView(views: editButtons); toolRow.orientation = .horizontal; toolRow.spacing = 4; toolRow.alignment = .centerY
-        let outputRow = NSStackView(views: outputButtons); outputRow.orientation = .horizontal; outputRow.spacing = 4; outputRow.alignment = .centerY
+        let tools = [("select", AnnotationTool.select), ("arrow", AnnotationTool.arrow), ("rectangle", AnnotationTool.rectangle), ("pen", AnnotationTool.pen), ("text", AnnotationTool.text), ("mosaic", AnnotationTool.mosaic), ("annotation", AnnotationTool.crop)].enumerated().map { index, entry in
+            figmaButton(entry.0, action: #selector(toolPressed(_:)), tag: index, label: entry.1.rawValue)
+        }
+        let undo = figmaButton("undo", action: #selector(undoPressed), label: "撤销")
+        let close = figmaButton("close", action: #selector(closePressed), label: "关闭")
+        let longShot = figmaButton("long-shot", action: #selector(stylePressed), label: "样式")
+        let pin = figmaButton("pin", action: #selector(pinPressed), label: "贴图")
+        let save = figmaButton("save", action: #selector(savePressed), label: "保存")
+        let copy = figmaButton("copy", action: #selector(copyPressed), label: "复制")
+        toolbarControls = tools + [undo, close, longShot]
+        outputControls = [pin, save, copy]
+        let divider = { () -> NSView in let view = NSView(frame: NSRect(x: 0, y: 0, width: 1, height: 12)); view.wantsLayer = true; view.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.28).cgColor; return view }
+        let content = NSStackView(views: tools + [divider(), undo, close, divider(), longShot, divider(), pin, save, copy])
+        content.orientation = .horizontal; content.spacing = 16; content.alignment = .centerY
         let toolbar = NSVisualEffectView(frame: .zero); toolbar.material = .hudWindow; toolbar.state = .active; toolbar.wantsLayer = true; toolbar.layer?.cornerRadius = 10
-        let content = NSStackView(views: [toolRow, outputRow])
-        content.spacing = 4; content.alignment = .centerY
-        let twoLines = CaptureOverlayLayout.toolbarUsesTwoLines(fixedWidth: toolRow.fittingSize.width + outputRow.fittingSize.width + 7 + 20, visibleWidth: targetScreen.visibleFrame.width)
-        content.orientation = twoLines ? .vertical : .horizontal
         toolbar.addSubview(content)
         content.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([content.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 10), content.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -10), content.topAnchor.constraint(equalTo: toolbar.topAnchor, constant: 4), content.bottomAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: -4)])
+        NSLayoutConstraint.activate([content.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 18), content.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -18), content.topAnchor.constraint(equalTo: toolbar.topAnchor, constant: 12), content.bottomAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: -12)])
         toolbar.layoutSubtreeIfNeeded()
         updateStyleControls(for: .select)
-        toolbar.layoutSubtreeIfNeeded()
         let visible = targetScreen.visibleFrame.offsetBy(dx: -targetScreen.frame.minX, dy: -targetScreen.frame.minY)
-        toolbarFixedSize = CaptureOverlayLayout.toolbarSize(toolbar.fittingSize, visibleFrame: visible)
-        toolbarFixedSize.height = twoLines ? 80 : 40
+        toolbarFixedSize = CaptureOverlayLayout.toolbarSize(NSSize(width: 600, height: 46), visibleFrame: visible)
         addSubview(toolbar); self.toolbar = toolbar
         positionToolbar()
         updateFocusChain()
@@ -716,9 +718,21 @@ final class SelectionView: NSView {
 
     private func button(_ title: String, _ action: Selector) -> NSButton { NSButton(title: title, target: self, action: action) }
 
-    @objc private func toolChanged(_ sender: NSSegmentedControl) {
-        let index = sender.selectedSegment
-        let tool = AnnotationTool.allCases[index]
+    private func figmaButton(_ imageName: String, action: Selector, tag: Int = 0, label: String) -> NSButton {
+        let button = NSButton(image: Self.figmaImage(imageName) ?? NSImage(), target: self, action: action)
+        button.imagePosition = .imageOnly; button.isBordered = false; button.tag = tag; button.setAccessibilityLabel(label); button.toolTip = label
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([button.widthAnchor.constraint(equalToConstant: 22), button.heightAnchor.constraint(equalToConstant: 22)])
+        return button
+    }
+
+    @objc private func toolPressed(_ sender: NSButton) {
+        let index = sender.tag
+        guard AnnotationTool.allCases.indices.contains(index) else { return }
+        selectTool(AnnotationTool.allCases[index], index: index)
+    }
+
+    private func selectTool(_ tool: AnnotationTool, index: Int) {
         if index == lastToolIndex, AnnotationTool.styledCases.contains(tool), optionsPanel?.isVisible == true {
             hideOptionsPanel()
             return
@@ -778,7 +792,7 @@ final class SelectionView: NSView {
         optionsPanel = nil
         updateFocusChain()
         window?.makeKey()
-        window?.makeFirstResponder(styleButton)
+        window?.makeFirstResponder(editor)
     }
 
     private func installOptionsMonitors() {
@@ -915,7 +929,6 @@ final class SelectionView: NSView {
         currentAnnotationColor = color
         updateColorButtons()
         updateMemoryLabel(for: tool)
-        updateStyleButton()
     }
 
     @objc private func eyedropperPressed() {
@@ -1041,7 +1054,6 @@ final class SelectionView: NSView {
         editor.applyStyleLive(color: currentAnnotationColor, size: value)
         updateMemoryLabel(for: tool)
         updateSizeValue(value, for: tool)
-        updateStyleButton()
         let now = Date.now
         guard AccessibilityAnnouncements.shouldPost(lastAnnouncementAt: lastStyleAnnouncementAt, now: now) else { return }
         lastStyleAnnouncementAt = now
@@ -1056,7 +1068,6 @@ final class SelectionView: NSView {
         model.persist()
         updateMemoryLabel(for: tool)
         updateSizeValue(value, for: tool)
-        updateStyleButton()
     }
 
     @objc private func sizePresetPressed(_ sender: NSButton) {
@@ -1069,7 +1080,6 @@ final class SelectionView: NSView {
         model.persist()
         updateMemoryLabel(for: tool)
         updateSizeValue(value, for: tool)
-        updateStyleButton()
     }
 
     @objc private func closePressed() {
@@ -1102,39 +1112,14 @@ final class SelectionView: NSView {
             catch { model?.showError("保存失败。结果仍保留，请重试或另存为。") }
         }
     }
-    @objc private func sharePressed() {
-        guard let image = renderOutput(), let toolbar else { return }
-        pendingShareImage = image
-        let picker = NSSharingServicePicker(items: [image]); picker.delegate = self; picker.show(relativeTo: toolbar.bounds, of: toolbar, preferredEdge: .minY)
-    }
     @objc private func pinPressed() { guard let image = renderOutput() else { return }; PinWindowController.show(image); commit(image) }
     private func renderOutput() -> NSImage? { hideOptionsPanel(); return editor?.render() }
     private func commit(_ image: NSImage) { phase.commit(); onCommit?(image) }
 
     private func updateStyleControls(for tool: AnnotationTool) {
         currentAnnotationColor = NSColor(hex: model?.settings.annotationColors[tool.rawValue] ?? "#FF3B30") ?? .systemRed
-        updateStyleButton()
         updateColorButtons()
         updateMemoryLabel(for: tool)
-    }
-    private func updateStyleButton() {
-        guard let tool = editor?.tool else { return }
-        let styled = AnnotationTool.styledCases.contains(tool)
-        styleButton.isEnabled = styled
-        if styled {
-            let size = currentSize(for: tool)
-            let summary = tool == .mosaic ? "\(Int(size)) px" : "\(Int(size)) pt"
-            styleButton.image = tool == .mosaic ? nil : Self.swatchImage(currentAnnotationColor, size: NSSize(width: 18, height: 13))
-            styleButton.imagePosition = tool == .mosaic ? .noImage : .imageLeading
-            styleButton.title = summary
-            styleButton.toolTip = "样式 · \(summary)"
-        } else {
-            styleButton.image = nil
-            styleButton.imagePosition = .noImage
-            styleButton.title = "样式"
-            styleButton.toolTip = "该工具无样式选项"
-        }
-        styleButton.setAccessibilityLabel("样式 \(styleButton.title)")
     }
     private func updateColorButtons() {
         for (index, button) in swatchButtons.enumerated() where index < Self.presetColors.count {
@@ -1234,8 +1219,19 @@ final class SelectionView: NSView {
         selection = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY).integral.intersection(bounds)
     }
     private func drawHandles(around rect: CGRect) {
-        NSColor.white.setFill()
-        for point in [CGPoint(x: rect.minX, y: rect.minY), CGPoint(x: rect.midX, y: rect.minY), CGPoint(x: rect.maxX, y: rect.minY), CGPoint(x: rect.minX, y: rect.midY), CGPoint(x: rect.maxX, y: rect.midY), CGPoint(x: rect.minX, y: rect.maxY), CGPoint(x: rect.midX, y: rect.maxY), CGPoint(x: rect.maxX, y: rect.maxY)] { NSBezierPath(ovalIn: CGRect(x: point.x - 4, y: point.y - 4, width: 8, height: 8)).fill() }
+        let points = [
+            CGPoint(x: rect.minX, y: rect.minY), CGPoint(x: rect.midX, y: rect.minY), CGPoint(x: rect.maxX, y: rect.minY),
+            CGPoint(x: rect.minX, y: rect.midY), CGPoint(x: rect.maxX, y: rect.midY),
+            CGPoint(x: rect.minX, y: rect.maxY), CGPoint(x: rect.midX, y: rect.maxY), CGPoint(x: rect.maxX, y: rect.maxY)
+        ]
+        NSColor(calibratedRed: CGFloat(0x07) / 255, green: CGFloat(0xC1) / 255, blue: CGFloat(0x60) / 255, alpha: 1).setFill()
+        for point in points {
+            let path = NSBezierPath(ovalIn: CGRect(x: point.x - 5, y: point.y - 5, width: 10, height: 10))
+            path.fill()
+            NSColor.white.setStroke()
+            path.lineWidth = 2
+            path.stroke()
+        }
     }
 }
 
@@ -1282,13 +1278,6 @@ private final class EyeDropperPreviewView: NSView {
             colorLabel.stringValue = "■"
             hexLabel.stringValue = String(format: "#%02X%02X%02X", Int(device.redComponent * 255), Int(device.greenComponent * 255), Int(device.blueComponent * 255))
         }
-    }
-}
-
-extension SelectionView: NSSharingServicePickerDelegate {
-    func sharingServicePicker(_ sharingServicePicker: NSSharingServicePicker, didChoose service: NSSharingService?) {
-        guard service != nil, let image = pendingShareImage else { pendingShareImage = nil; return }
-        pendingShareImage = nil; commit(image)
     }
 }
 

@@ -3,11 +3,10 @@ import AVKit
 import UniformTypeIdentifiers
 
 @MainActor
-final class ResultWindowController: NSWindowController, NSSharingServicePickerDelegate {
+final class ResultWindowController: NSWindowController {
     static let shared = ResultWindowController()
     private var editor: AnnotationView?
     private weak var model: AppModel?
-    private var shareButton: NSButton?
     private var outputCompleted = false
     private let colorWell = NSColorWell(frame: NSRect(x: 0, y: 0, width: 44, height: 28))
     private let sizePopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -35,9 +34,8 @@ final class ResultWindowController: NSWindowController, NSSharingServicePickerDe
         let redo = button("重做", action: #selector(redo), key: "Z")
         let copy = button("复制", action: #selector(copyImage), key: "\r")
         let save = button("保存…", action: #selector(saveImage))
-        let share = button("分享…", action: #selector(shareImage)); shareButton = share
         let pin = button("贴图", action: #selector(pinImage))
-        let toolbar = NSStackView(views: [tools, colorWell, sizePopup, undo, redo, NSView(), share, save, pin, copy])
+        let toolbar = NSStackView(views: [tools, colorWell, sizePopup, undo, redo, NSView(), save, pin, copy])
         toolbar.orientation = .horizontal; toolbar.spacing = 8; toolbar.alignment = .centerY
         let scroll = NSScrollView(); scroll.documentView = editor; scroll.hasHorizontalScroller = true; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
         let root = NSStackView(views: [scroll, toolbar]); root.orientation = .vertical; root.spacing = 10; root.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
@@ -75,7 +73,6 @@ final class ResultWindowController: NSWindowController, NSSharingServicePickerDe
         }
     }
 
-    @objc private func shareImage() { guard let image = editor?.render(), let shareButton else { return }; NSSharingServicePicker(items: [image]).show(relativeTo: shareButton.bounds, of: shareButton, preferredEdge: .minY) }
     @objc private func pinImage() { guard let image = editor?.render() else { return }; outputCompleted = true; model?.recentResult = .image(image); PinWindowController.show(image) }
     private func updateStyleControls(for tool: AnnotationTool) {
         let styled = AnnotationTool.styledCases.contains(tool); colorWell.isHidden = !styled || tool == .mosaic; sizePopup.isHidden = !styled
@@ -96,7 +93,51 @@ extension ResultWindowController: NSWindowDelegate {
 
 enum Annotation: Equatable {
     case line(AnnotationTool, CGPoint, CGPoint, NSColor, CGFloat)
+    case path([CGPoint], NSColor, CGFloat)
     case text(String, CGPoint, NSColor, CGFloat)
+}
+
+enum AnnotationMath {
+    /// Perpendicular distance from `point` to the segment `a`–`b` (used for line/arrow/path hit tests).
+    static func distance(toSegment point: CGPoint, a: CGPoint, b: CGPoint) -> CGFloat {
+        let dx = b.x - a.x, dy = b.y - a.y
+        let lengthSquared = dx * dx + dy * dy
+        guard lengthSquared > 0 else { return hypot(point.x - a.x, point.y - a.y) }
+        let t = max(0, min(1, ((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSquared))
+        let px = a.x + t * dx, py = a.y + t * dy
+        return hypot(point.x - px, point.y - py)
+    }
+
+    static func distance(toPath point: CGPoint, points: [CGPoint]) -> CGFloat {
+        guard points.count > 1 else { return points.first.map { hypot(point.x - $0.x, point.y - $0.y) } ?? .greatestFiniteMagnitude }
+        return (0..<(points.count - 1)).reduce(CGFloat.greatestFiniteMagnitude) { min($0, distance(toSegment: point, a: points[$1], b: points[$1 + 1])) }
+    }
+
+    static func pathLength(_ points: [CGPoint]) -> CGFloat {
+        guard points.count > 1 else { return 0 }
+        var length: CGFloat = 0
+        for i in 0..<(points.count - 1) {
+            length += hypot(points[i + 1].x - points[i].x, points[i + 1].y - points[i].y)
+        }
+        return length
+    }
+
+    /// Catmull-Rom → cubic Bézier smoothing that passes near every sampled point (FR-BRA71-02).
+    static func smoothPath(_ points: [CGPoint]) -> NSBezierPath {
+        let path = NSBezierPath()
+        guard points.count >= 2 else { return path }
+        path.move(to: points[0])
+        for i in 0..<(points.count - 1) {
+            let p0 = points[max(0, i - 1)]
+            let p1 = points[i]
+            let p2 = points[i + 1]
+            let p3 = points[min(points.count - 1, i + 2)]
+            let cp1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6, y: p1.y + (p2.y - p0.y) / 6)
+            let cp2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6, y: p2.y - (p3.y - p1.y) / 6)
+            path.curve(to: p2, controlPoint1: cp1, controlPoint2: cp2)
+        }
+        return path
+    }
 }
 
 struct EditorState {
@@ -105,7 +146,9 @@ struct EditorState {
 }
 
 final class AnnotationView: NSView {
-    var tool = AnnotationTool.select
+    var tool = AnnotationTool.select {
+        didSet { commitTextEditingIfActive() }
+    }
     private let original: NSImage
     private let originalCG: CGImage?
     private let pixelsPerPoint: CGFloat
@@ -118,7 +161,11 @@ final class AnnotationView: NSView {
     private var moving = false
     private var start: CGPoint?
     private var draft: CGPoint?
+    private var strokePoints: [CGPoint] = []
     private var cropRect: CGRect?
+    private var textEditor: InlineTextView?
+    private var textEditorAnchor = CGPoint.zero
+    private var textEditingIndex: Int?
     private var liveColors: [String: NSColor]
     private var liveSizes: [String: CGFloat]
     var managesOwnHistory = true
@@ -160,35 +207,65 @@ final class AnnotationView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let point = bounded(convert(event.locationInWindow, from: nil))
-        if event.clickCount >= 2, onDoubleClick != nil, tool == .select {
-            onDoubleClick?()
+        commitTextEditingIfActive()
+        if tool == .select, let hit = annotations.indices.reversed().first(where: { hitTest(point, annotation: annotations[$0]) }) {
+            if event.clickCount >= 2, case .text = annotations[hit] {
+                beginTextEditing(existingIndex: hit)
+                return
+            }
+            selected = hit
+            moving = true
+            remember()
+            start = point; draft = point; needsDisplay = true
             return
         }
         if tool == .select {
-            selected = annotations.indices.reversed().first { bounds(of: annotations[$0]).insetBy(dx: -8, dy: -8).contains(point) }
-            moving = selected != nil
-            if moving { remember() }
-            else { onSelectionDragBegan?(event) }
+            if event.clickCount >= 2, onDoubleClick != nil { onDoubleClick?(); return }
+            selected = nil
+            moving = false
+            onSelectionDragBegan?(event)
+            start = point; draft = point; needsDisplay = true
+            return
         }
-        start = point; draft = point; needsDisplay = true
+        if tool == .text {
+            selected = nil
+            moving = false
+            beginTextEditing(at: point)
+            return
+        }
+        selected = nil
+        moving = false
+        start = point; draft = point; strokePoints = [point]; needsDisplay = true
     }
     override func mouseDragged(with event: NSEvent) {
         let point = bounded(convert(event.locationInWindow, from: nil))
         if moving, let selected, let draft { annotations[selected] = offset(annotations[selected], dx: point.x - draft.x, dy: point.y - draft.y) }
         else if tool == .select { onSelectionDragged?(event) }
+        else if tool == .pen { if strokePoints.last != point { strokePoints.append(point) } }
         draft = point; needsDisplay = true
     }
     override func mouseUp(with event: NSEvent) {
         guard let start, let end = draft else { return }
         defer { self.start = nil; draft = nil; needsDisplay = true }
         if tool == .select, !moving { onSelectionDragEnded?() }
-        if tool == .text {
-            let alert = NSAlert(); alert.messageText = "添加文字"; let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24)); alert.accessoryView = field; alert.addButton(withTitle: "添加"); alert.addButton(withTitle: "取消")
-            alert.window.level = window?.level ?? .modalPanel
-            if alert.runModal() == .alertFirstButtonReturn, !field.stringValue.isEmpty { remember(); annotations.append(.text(field.stringValue, start, color(for: tool), size(for: tool))) }
-        } else if tool == .crop { remember(); cropRect = rect(start, end).intersection(bounds) }
-        else if tool != .select { remember(); annotations.append(.line(tool, start, end, color(for: tool), size(for: tool))) }
+        if tool == .crop { remember(); cropRect = rect(start, end).intersection(bounds) }
+        else if tool == .pen {
+            if AnnotationMath.pathLength(strokePoints) < 2 {
+                remember(); annotations.append(.path([start], color(for: tool), size(for: tool)))
+            } else {
+                remember(); annotations.append(.path(strokePoints, color(for: tool), size(for: tool)))
+            }
+        }
+        else if tool != .select {
+            let shape = rect(start, end)
+            if tool == .mosaic && shape.width < 4 && shape.height < 4 {
+                // Tiny drags (both axes < 4 pt) do not create a mosaic object.
+            } else {
+                remember(); annotations.append(.line(tool, start, end, color(for: tool), size(for: tool)))
+            }
+        }
         moving = false
+        strokePoints = []
     }
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { onEscape?() }
@@ -218,9 +295,16 @@ final class AnnotationView: NSView {
     func applyStyleLive(color: NSColor, size: Double) {
         liveColors[tool.rawValue] = color
         liveSizes[tool.rawValue] = CGFloat(size)
+        if let textEditor {
+            textEditor.font = NSFont.systemFont(ofSize: CGFloat(size), weight: .semibold)
+            textEditor.textColor = color
+            resizeTextEditor()
+            needsDisplay = true
+        }
         guard let selected else { return }
         switch annotations[selected] {
         case .line(let tool, let a, let b, _, _): annotations[selected] = .line(tool, a, b, color, size)
+        case .path(let points, _, _): annotations[selected] = .path(points, color, size)
         case .text(let text, let point, _, _): annotations[selected] = .text(text, point, color, size)
         }
         needsDisplay = true
@@ -231,8 +315,16 @@ final class AnnotationView: NSView {
         drawBaseImage()
         for annotation in annotations { draw(annotation) }
         if let selected { NSColor.controlAccentColor.setStroke(); let path = NSBezierPath(rect: bounds(of: annotations[selected]).insetBy(dx: -4, dy: -4)); path.lineWidth = 1; path.stroke() }
-        if let start, let draft, tool != .select && tool != .text { draw(.line(tool, start, draft, color(for: tool), size(for: tool))) }
+        if tool == .pen, !strokePoints.isEmpty { draw(.path(strokePoints, color(for: tool), size(for: tool))) }
+        else if let start, let draft, tool != .select && tool != .text { draw(.line(tool, start, draft, color(for: tool), size(for: tool))) }
         if let cropRect { NSColor.white.withAlphaComponent(0.75).setStroke(); let path = NSBezierPath(rect: cropRect); path.lineWidth = 2; path.stroke() }
+        if let textEditor {
+            NSColor.controlAccentColor.setStroke()
+            let border = NSBezierPath(roundedRect: textEditor.frame.insetBy(dx: -2, dy: -2), xRadius: 4, yRadius: 4)
+            border.lineWidth = 1
+            border.setLineDash([3, 2], count: 2, phase: 0)
+            border.stroke()
+        }
     }
 
     private func drawBaseImage() {
@@ -268,6 +360,7 @@ final class AnnotationView: NSView {
     }
 
     func render() -> NSImage? {
+        commitTextEditingIfActive()
         let target = (cropRect ?? bounds).intersection(bounds)
         guard !target.isEmpty, let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int((target.width * pixelsPerPoint).rounded()), pixelsHigh: Int((target.height * pixelsPerPoint).rounded()), bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
         bitmap.size = target.size
@@ -299,10 +392,21 @@ final class AnnotationView: NSView {
     private func draw(_ annotation: Annotation) {
         switch annotation {
         case .text(let text, let point, let color, let size): text.draw(at: point, withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold), .foregroundColor: color])
+        case .path(let points, let color, let width):
+            if points.count == 1 {
+                color.setFill()
+                NSBezierPath(ovalIn: CGRect(x: points[0].x - width / 2, y: points[0].y - width / 2, width: width, height: width)).fill()
+                return
+            }
+            let path = AnnotationMath.smoothPath(points)
+            color.setStroke()
+            path.lineWidth = width; path.lineCapStyle = .round; path.lineJoinStyle = .round
+            path.stroke()
         case .line(let tool, let start, let end, let color, let width):
-            if tool == .mosaic { mosaic(from: start, to: end, size: width); return }
+            if tool == .mosaic { mosaic(rect: rect(start, end), size: width); return }
             color.setStroke(); let path = NSBezierPath(); path.lineWidth = width; path.lineCapStyle = .round
-            if tool == .rectangle { path.appendRect(rect(start, end)) } else { path.move(to: start); path.line(to: end) }
+            if tool == .rectangle { path.appendRect(rect(start, end)) }
+            else { path.move(to: start); path.line(to: end) }
             path.stroke()
             if tool == .arrow {
                 let angle = atan2(end.y - start.y, end.x - start.x); let length = max(10, width * 4)
@@ -310,39 +414,177 @@ final class AnnotationView: NSView {
             }
         }
     }
-    private func mosaic(from start: CGPoint, to end: CGPoint, size: CGFloat) {
-        let distance = max(1, hypot(end.x - start.x, end.y - start.y))
-        for step in stride(from: CGFloat(0), through: distance, by: max(4, size / 2)) {
-            let t = step / distance; let tile = CGRect(x: start.x + (end.x - start.x) * t - size / 2, y: start.y + (end.y - start.y) * t - size / 2, width: size, height: size).intersection(bounds)
-            if let cg = originalCG {
-                let pixelRect = CGRect(x: (sourceRect.minX + tile.minX) * pixelsPerPoint,
-                                       y: (screenPointSize.height - sourceRect.maxY + tile.minY) * pixelsPerPoint,
-                                       width: tile.width * pixelsPerPoint,
-                                       height: tile.height * pixelsPerPoint)
-                guard let sub = Self.clampedCrop(cg, pixelRect) else { continue }
-                let tiny = NSImage(size: NSSize(width: 4, height: 4)); tiny.lockFocus(); NSImage(cgImage: sub, size: NSSize(width: 4, height: 4)).draw(in: CGRect(x: 0, y: 0, width: 4, height: 4)); tiny.unlockFocus()
-                NSGraphicsContext.current?.imageInterpolation = .none; tiny.draw(in: tile, from: .zero, operation: .copy, fraction: 1)
-            } else {
-                let sourceTile = tile.offsetBy(dx: sourceRect.minX, dy: sourceRect.minY)
-                let tiny = NSImage(size: NSSize(width: 4, height: 4)); tiny.lockFocus(); original.draw(in: CGRect(x: 0, y: 0, width: 4, height: 4), from: sourceTile, operation: .copy, fraction: 1); tiny.unlockFocus()
-                NSGraphicsContext.current?.imageInterpolation = .none; tiny.draw(in: tile, from: .zero, operation: .copy, fraction: 1)
+    /// Pixelates the whole rectangle (FR-BRA71-01: mosaic is a rectangular object, not a brush trail).
+    private func mosaic(rect: CGRect, size: CGFloat) {
+        let block = max(4, size)
+        var y = rect.minY
+        while y < rect.maxY {
+            var x = rect.minX
+            while x < rect.maxX {
+                let tile = CGRect(x: x, y: y, width: min(block, rect.maxX - x), height: min(block, rect.maxY - y)).intersection(bounds)
+                if tile.width <= 0 || tile.height <= 0 { x += block; continue }
+                if let cg = originalCG {
+                    let pixelRect = CGRect(x: (sourceRect.minX + tile.minX) * pixelsPerPoint,
+                                           y: (screenPointSize.height - sourceRect.maxY + tile.minY) * pixelsPerPoint,
+                                           width: tile.width * pixelsPerPoint,
+                                           height: tile.height * pixelsPerPoint)
+                    guard let sub = Self.clampedCrop(cg, pixelRect) else { x += block; continue }
+                    let tiny = NSImage(size: NSSize(width: 4, height: 4)); tiny.lockFocus(); NSImage(cgImage: sub, size: NSSize(width: 4, height: 4)).draw(in: CGRect(x: 0, y: 0, width: 4, height: 4)); tiny.unlockFocus()
+                    NSGraphicsContext.current?.imageInterpolation = .none; tiny.draw(in: tile, from: .zero, operation: .copy, fraction: 1)
+                } else {
+                    let sourceTile = tile.offsetBy(dx: sourceRect.minX, dy: sourceRect.minY)
+                    let tiny = NSImage(size: NSSize(width: 4, height: 4)); tiny.lockFocus(); original.draw(in: CGRect(x: 0, y: 0, width: 4, height: 4), from: sourceTile, operation: .copy, fraction: 1); tiny.unlockFocus()
+                    NSGraphicsContext.current?.imageInterpolation = .none; tiny.draw(in: tile, from: .zero, operation: .copy, fraction: 1)
+                }
+                x += block
             }
+            y += block
         }
     }
     var stateSnapshot: EditorState { EditorState(annotations: annotations, crop: cropRect) }
     func update(sourceRect: CGRect) { self.sourceRect = sourceRect; frame.size = sourceRect.size; needsDisplay = true }
-    func restore(_ state: EditorState) { annotations = state.annotations; cropRect = state.crop; selected = nil; needsDisplay = true }
+    func restore(_ state: EditorState) { annotations = state.annotations; cropRect = state.crop; selected = nil; textEditor?.removeFromSuperview(); textEditor = nil; textEditingIndex = nil; needsDisplay = true }
     private func remember() {
         onWillChange?()
         guard managesOwnHistory else { return }
         undoStack.append(stateSnapshot); if undoStack.count > 20 { undoStack.removeFirst() }; redoStack.removeAll()
     }
-    private func offset(_ item: Annotation, dx: CGFloat, dy: CGFloat) -> Annotation { switch item { case .line(let tool, let a, let b, let color, let width): .line(tool, CGPoint(x: a.x + dx, y: a.y + dy), CGPoint(x: b.x + dx, y: b.y + dy), color, width); case .text(let text, let point, let color, let size): .text(text, CGPoint(x: point.x + dx, y: point.y + dy), color, size) } }
-    private func bounds(of item: Annotation) -> CGRect { switch item { case .line(_, let a, let b, _, let width): rect(a, b).insetBy(dx: -max(4, width), dy: -max(4, width)); case .text(let text, let point, _, let size): CGRect(origin: point, size: text.size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold)])) } }
+    private func offset(_ item: Annotation, dx: CGFloat, dy: CGFloat) -> Annotation {
+        switch item {
+        case .line(let tool, let a, let b, let color, let width): .line(tool, CGPoint(x: a.x + dx, y: a.y + dy), CGPoint(x: b.x + dx, y: b.y + dy), color, width)
+        case .path(let points, let color, let width): .path(points.map { CGPoint(x: $0.x + dx, y: $0.y + dy) }, color, width)
+        case .text(let text, let point, let color, let size): .text(text, CGPoint(x: point.x + dx, y: point.y + dy), color, size)
+        }
+    }
+    private func bounds(of item: Annotation) -> CGRect {
+        switch item {
+        case .line(let tool, let a, let b, _, let width):
+            if tool == .rectangle || tool == .mosaic { return rect(a, b) }
+            return rect(a, b).insetBy(dx: -max(4, width), dy: -max(4, width))
+        case .path(let points, _, let width):
+            guard let first = points.first else { return .zero }
+            let xs = points.map(\.x), ys = points.map(\.y)
+            return CGRect(x: xs.min() ?? first.x, y: ys.min() ?? first.y, width: (xs.max() ?? first.x) - (xs.min() ?? first.x), height: (ys.max() ?? first.y) - (ys.min() ?? first.y)).insetBy(dx: -max(4, width), dy: -max(4, width))
+        case .text(let text, let point, _, let size): return CGRect(origin: point, size: text.size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold)]))
+        }
+    }
+    private func hitTest(_ point: CGPoint, annotation: Annotation) -> Bool {
+        switch annotation {
+        case .line(let tool, let a, let b, _, let width):
+            if tool == .rectangle || tool == .mosaic { return rect(a, b).insetBy(dx: -4, dy: -4).contains(point) }
+            return AnnotationMath.distance(toSegment: point, a: a, b: b) <= max(width / 2, 8)
+        case .path(let points, _, let width):
+            return AnnotationMath.distance(toPath: point, points: points) <= max(width / 2, 8)
+        case .text:
+            return bounds(of: annotation).insetBy(dx: -4, dy: -4).contains(point)
+        }
+    }
     private func color(for tool: AnnotationTool) -> NSColor { liveColors[tool.rawValue] ?? .systemRed }
     private func size(for tool: AnnotationTool) -> CGFloat { liveSizes[tool.rawValue] ?? CGFloat(AnnotationTool.defaultSize(for: tool)) }
     private func rect(_ a: CGPoint, _ b: CGPoint) -> CGRect { CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y)) }
     private func bounded(_ point: CGPoint) -> CGPoint { CGPoint(x: min(max(0, point.x), bounds.width), y: min(max(0, point.y), bounds.height)) }
+
+    // MARK: In-place text editing (FR-BRA71-04)
+
+    func commitTextEditingIfActive() {
+        guard textEditor != nil else { return }
+        commitTextEditing()
+    }
+
+    private func beginTextEditing(at point: CGPoint? = nil, existingIndex: Int? = nil) {
+        commitTextEditingIfActive()
+        let existing = existingIndex.flatMap { index in annotations.indices.contains(index) ? annotations[index] : nil }
+        let stored: (NSColor, CGFloat)? = {
+            if case .text(_, _, let c, let s)? = existing { return (c, s) }
+            return nil
+        }()
+        let color = stored?.0 ?? color(for: .text)
+        let size = stored?.1 ?? size(for: .text)
+        let font = NSFont.systemFont(ofSize: size, weight: .semibold)
+        let text = { if case .text(let string, _, _, _)? = existing { string } else { "" } }()
+        let origin = { if case .text(_, let origin, _, _)? = existing { origin } else { point ?? .zero } }()
+
+        selected = existingIndex
+        textEditingIndex = existingIndex
+        textEditorAnchor = origin
+
+        let editor = InlineTextView(frame: .zero)
+        editor.font = font
+        editor.textColor = color
+        editor.string = text
+        editor.isRichText = false
+        editor.isEditable = true
+        editor.isSelectable = true
+        editor.drawsBackground = false
+        editor.allowsUndo = false
+        editor.isHorizontallyResizable = true
+        editor.isVerticallyResizable = false
+        editor.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        editor.textContainer?.widthTracksTextView = false
+        editor.textContainer?.maximumNumberOfLines = 1
+        editor.textContainer?.lineBreakMode = .byClipping
+        editor.onTextChange = { [weak self] in self?.resizeTextEditor() }
+        editor.onCommit = { [weak self] in self?.commitTextEditing() }
+        editor.onCancel = { [weak self] in self?.commitTextEditing() }
+        textEditor = editor
+        addSubview(editor)
+        resizeTextEditor()
+        window?.makeFirstResponder(editor)
+        needsDisplay = true
+    }
+
+    private func commitTextEditing() {
+        guard let editor = textEditor else { return }
+        let color = editor.textColor ?? color(for: .text)
+        let size = editor.font?.pointSize ?? size(for: .text)
+        let point = textEditorAnchor
+        let string = editor.string
+        let index = textEditingIndex
+        textEditor = nil
+        textEditingIndex = nil
+        editor.removeFromSuperview()
+        if let index, annotations.indices.contains(index), case .text = annotations[index] {
+            if string.isEmpty {
+                remember()
+                annotations.remove(at: index)
+                selected = nil
+            } else {
+                remember()
+                annotations[index] = .text(string, point, color, size)
+                selected = index
+            }
+        } else if !string.isEmpty {
+            remember()
+            let newIndex = annotations.count
+            annotations.append(.text(string, point, color, size))
+            selected = newIndex
+        }
+        needsDisplay = true
+        window?.makeFirstResponder(self)
+    }
+
+    private func resizeTextEditor() {
+        guard let textEditor else { return }
+        let font = textEditor.font ?? NSFont.systemFont(ofSize: size(for: .text), weight: .semibold)
+        let width = max(24, (textEditor.string as NSString).size(withAttributes: [.font: font]).width + 8)
+        let height = max(20, font.ascender - font.descender + 6)
+        let frame = NSRect(x: textEditorAnchor.x, y: textEditorAnchor.y, width: min(width, bounds.width - textEditorAnchor.x), height: height)
+        textEditor.frame = frame
+        needsDisplay = true
+    }
+}
+
+private final class InlineTextView: NSTextView {
+    var onTextChange: (() -> Void)?
+    var onCommit: (() -> Void)?
+    var onCancel: (() -> Void)?
+
+    override func didChangeText() {
+        super.didChangeText()
+        onTextChange?()
+    }
+    override func insertNewline(_ sender: Any?) { onCommit?() }
+    override func cancelOperation(_ sender: Any?) { onCancel?() }
 }
 
 enum PinZoom {

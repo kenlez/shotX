@@ -95,7 +95,7 @@ enum AnnotationTool: String, CaseIterable, Identifiable {
     var styleLabel: String {
         switch self {
         case .text: "字号"
-        case .mosaic: "笔刷大小"
+        case .mosaic: "块大小"
         default: "粗细"
         }
     }
