@@ -115,14 +115,16 @@
 
 ## 3. 阻断项与开放问题（QA 记录）
 
-- **B1（交付阻断）**：分支提交缺 `Assets/Figma/*.svg` 与 `Package.swift` resources 声明，干净检出无法编译；须将二者纳入 PR 后再交付。**BRA-75 复核已复现（`type 'Bundle' has no member 'module'`）。**
-- **B2（功能阻断，FR-BRA71-03）**：新工具栏无「选择」工具入口，绘制工具使用后无法回到选择态，对象不可选中/移动/删除。**BRA-75 复核确认**：工具栏 8 按钮 tag 0–7 映射 `AnnotationTool.allCases[1…8]`，无 `.select`；`toolChanged(_:)` 分段控件处理器随旧控件删除成死代码。
-- **B3（功能阻断，FR-BRA71-04 样式部分）**：文字样式「T」按钮为空实现（beep），文字颜色无浮层控件，无法满足「颜色/样式即时反映」。**BRA-75 复核确认**：`textStylePressed() { NSSound.beep() }`；色点在 `!isText && tool != .mosaic` 分支构建，文字工具无颜色入口；GT-71-04-4 无法通过。另：`commitTextEditing()` 对双击重入对象以当前 live 样式覆写存储样式，GT-71-04-3「颜色/字号保持」在样式已变时可能不成立。
-- **B4（回归，FR-CAP-15/16 与旧选项面板）**：BRA-71 分支将旧 300 pt 选项面板（记忆行 + 12 色 + 取色器 + 可拖拽滑杆）替换为 144/192 pt 迷你面板（大小圆点 + 6 预设色），`makeMemoryRow/makeColorSection/makeSizeSection`、`BrushSlider` 及取色器 UI 均成死代码；PRD §1.1 声明「现有 CAP-04/05/07/09/15/16 与本节共同适用」，与 UX 标注 §3.2「拖拽条为默认入口（FR-CAP-16 机制不变）」冲突，需产品确认或恢复。**BRA-75 复核确认死代码范围（含 `toolChanged` 与取色器全套）。**
-- **B5（文档，FR-BRA71-05）**：`docs/QA-ACCEPTANCE-MATRIX.md`（CAP-06、§15-3）与旧手测清单仍含「分享」表述，按 FR-BRA71-05「文档不再展示分享」口径需一并清理。**BRA-75 复核确认**：`QA-ACCEPTANCE-MATRIX.md:36`（CAP-06）、`:70`（第 3 行）仍含「分享」；`RELEASE-NOTES.md:21`、`QA-MANUAL-TEST-CHECKLIST-BRA-38.md:56`、`BRA-55:28,56` 亦残留。
-- **B6（逻辑偏离，FR-BRA71-01）**：马赛克丢弃条件用 `||` 而非「两轴均 < 4 pt」的 `&&`，单轴细条被误丢；用例未覆盖。修复：改 `&&` 并加单轴测试。
-- **B7（可访问性，低）**：`sizeDotPressed` 的 `setAccessibilityLabel` 插值缺 `\(`，读出为字面文本。
-- **B8（范围外）**：`.ellipse`/`.line` 工具、选区边框重绘、12→6 色、暗色工具栏均非 PRD §1.1 内容，需产品确认是否保留。
+> 2026-08-13 BRA-76 修复：B1–B8 已在 PR #5（`agent/bra-76-fixes @ 704478e`）关闭，见下方逐项标注；桌面交互仍待用户手测（§2）。
+
+- **B1（交付阻断）**：分支提交缺 `Assets/Figma/*.svg` 与 `Package.swift` resources 声明，干净检出无法编译；须将二者纳入 PR 后再交付。**BRA-75 复核已复现（`type 'Bundle' has no member 'module'`）。** → **BRA-76 已修复**：Assets + resources 入提交；`make app` 拷入 `ShotX_ShotX.bundle`。
+- **B2（功能阻断，FR-BRA71-03）**：新工具栏无「选择」工具入口，绘制工具使用后无法回到选择态，对象不可选中/移动/删除。**BRA-75 复核确认**：工具栏 8 按钮 tag 0–7 映射 `AnnotationTool.allCases[1…8]`，无 `.select`；`toolChanged(_:)` 分段控件处理器随旧控件删除成死代码。 → **BRA-76 已修复**：工具栏首按钮恢复「选择」；`toolChanged` 死代码已删。
+- **B3（功能阻断，FR-BRA71-04 样式部分）**：文字样式「T」按钮为空实现（beep），文字颜色无浮层控件，无法满足「颜色/样式即时反映」。**BRA-75 复核确认**：`textStylePressed() { NSSound.beep() }`；色点在 `!isText && tool != .mosaic` 分支构建，文字工具无颜色入口；GT-71-04-4 无法通过。另：`commitTextEditing()` 对双击重入对象以当前 live 样式覆写存储样式，GT-71-04-3「颜色/字号保持」在样式已变时可能不成立。 → **BRA-76 已修复**：恢复 300pt 样式浮层（文字含颜色与字号滑杆，即时反映）；`commitTextEditing` 改用编辑器当前样式，重入保留原色/字号（`testDoubleClickReentryPreservesStoredColorAndSize`）。
+- **B4（回归，FR-CAP-15/16 与旧选项面板）**：BRA-71 分支将旧 300 pt 选项面板（记忆行 + 12 色 + 取色器 + 可拖拽滑杆）替换为 144/192 pt 迷你面板（大小圆点 + 6 预设色），`makeMemoryRow/makeColorSection/makeSizeSection`、`BrushSlider` 及取色器 UI 均成死代码；PRD §1.1 声明「现有 CAP-04/05/07/09/15/16 与本节共同适用」，与 UX 标注 §3.2「拖拽条为默认入口（FR-CAP-16 机制不变）」冲突，需产品确认或恢复。**BRA-75 复核确认死代码范围（含 `toolChanged` 与取色器全套）。** → **BRA-76 已修复**：恢复 300pt 面板 + `BrushSlider` 可拖拽滑杆 + 12 色 + 取色器；马赛克标签为「块大小」。
+- **B5（文档，FR-BRA71-05）**：`docs/QA-ACCEPTANCE-MATRIX.md`（CAP-06、§15-3）与旧手测清单仍含「分享」表述，按 FR-BRA71-05「文档不再展示分享」口径需一并清理。**BRA-75 复核确认**：`QA-ACCEPTANCE-MATRIX.md:36`（CAP-06）、`:70`（第 3 行）仍含「分享」；`RELEASE-NOTES.md:21`、`QA-MANUAL-TEST-CHECKLIST-BRA-38.md:56`、`BRA-55:28,56` 亦残留。 → **BRA-76 已修复**：上述文档「分享」已移除，仅保留「已移除（FR-BRA71-05）」说明。
+- **B6（逻辑偏离，FR-BRA71-01）**：马赛克丢弃条件用 `||` 而非「两轴均 < 4 pt」的 `&&`，单轴细条被误丢；用例未覆盖。修复：改 `&&` 并加单轴测试。 → **BRA-76 已修复**：改 `&&`，新增 `testMosaicThinStripIsKept`。
+- **B7（可访问性，低）**：`sizeDotPressed` 的 `setAccessibilityLabel` 插值缺 `\(`，读出为字面文本。 → **BRA-76 已修复**：迷你面板代码删除，恢复面板用规范插值。
+- **B8（范围外）**：`.ellipse`/`.line` 工具、选区边框重绘、12→6 色、暗色工具栏均非 PRD §1.1 内容，需产品确认是否保留。 → **BRA-76 已修复**：撤回 `.ellipse`/`.line` 与视觉重绘，恢复原有工具集、`controlAccentColor` 边框与 12 色。
 
 ## 4. 反馈字段
 
