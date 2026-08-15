@@ -33,6 +33,7 @@ app: icons
 	rm -rf $(APP_NAME).app
 	mkdir -p $(APP_NAME).app/Contents/MacOS $(APP_NAME).app/Contents/Resources
 	cp .build/release/$(APP_NAME) $(APP_NAME).app/Contents/MacOS/$(APP_NAME)
+	cp -R .build/release/ShotX_ShotX.bundle $(APP_NAME).app/Contents/Resources/ShotX_ShotX.bundle
 	cp Support/Info.plist $(APP_NAME).app/Contents/Info.plist
 	cp $(ICON_ICNS) $(APP_NAME).app/Contents/Resources/$(APP_NAME).icns
 	/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(VERSION)" $(APP_NAME).app/Contents/Info.plist

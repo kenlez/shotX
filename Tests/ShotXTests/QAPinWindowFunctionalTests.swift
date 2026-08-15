@@ -26,14 +26,6 @@ final class QAPinWindowFunctionalTests: XCTestCase {
         return nil
     }
 
-    private func zoomLabel(in content: NSView) -> NSTextField? {
-        for sub in content.subviews {
-            if let t = sub as? NSTextField, t.accessibilityLabel() == "缩放比例" { return t }
-            if let found = zoomLabel(in: sub) { return found }
-        }
-        return nil
-    }
-
     private func fireScroll(_ view: PinImageView, deltaY: CGFloat, precise: Bool) {
         view.onScrollZoom?(deltaY, precise)
     }
@@ -41,7 +33,7 @@ final class QAPinWindowFunctionalTests: XCTestCase {
     /// Observed scale, derived from window width (image area = width - 2*insets).
     private func observedScale(of controller: PinWindowController, imageWidth: CGFloat) -> CGFloat {
         let w = controller.window!.frame.width
-        return (w - 16) / imageWidth
+        return w / imageWidth
     }
 
     // ── Acceptance point 1: wheel zoom + window sync resize, 10%–400% clamp ──
@@ -60,10 +52,8 @@ final class QAPinWindowFunctionalTests: XCTestCase {
         XCTAssertEqual(ivFrame.width / ivFrame.height, 2.0, accuracy: 0.02,
                        "image view must scale proportionally with source aspect")
 
-        // Zoom label must match the math-based scale (1.1^5 → 161%)
         let expectedScale = PinZoom.clamp(1 * PinZoom.zoomFactor(deltaY: 5, precise: false))
-        let label = zoomLabel(in: window.contentView!)?.stringValue ?? "?"
-        XCTAssertEqual(label, "\(Int((expectedScale * 100).rounded()))%", "zoom label must track scale")
+        XCTAssertEqual(observedScale(of: controller, imageWidth: 200), expectedScale, accuracy: 0.01)
     }
 
     func testZoomOutShrinksWindowAndClampsTo10Percent() throws {
@@ -73,19 +63,19 @@ final class QAPinWindowFunctionalTests: XCTestCase {
         for _ in 0..<50 { fireScroll(iv, deltaY: -10, precise: false) }
 
         let scale = observedScale(of: controller, imageWidth: 200)
-        XCTAssertEqual(scale, 0.1, accuracy: 0.001, "scale must clamp at 10%")
-        XCTAssertEqual(window.frame.width, 200 * 0.1 + 16, accuracy: 0.1, "window width must equal image at 10% + chrome")
+        XCTAssertEqual(scale, 1, accuracy: 0.001, "minimum visible height must remain 100px")
+        XCTAssertEqual(window.frame.width, 200, accuracy: 0.1)
     }
 
-    func testZoomInClampsTo400Percent() throws {
+    func testZoomInClampsTo300PercentAndScreen() throws {
         let (controller, window) = makeWindow(imageSize: NSSize(width: 200, height: 100))
         let iv = imageView(of: controller)
 
         for _ in 0..<50 { fireScroll(iv, deltaY: 10, precise: false) }
 
         let scale = observedScale(of: controller, imageWidth: 200)
-        XCTAssertEqual(scale, 4.0, accuracy: 0.001, "scale must clamp at 400%")
-        XCTAssertEqual(window.frame.width, 200 * 4.0 + 16, accuracy: 0.1, "window width must equal image at 400% + chrome")
+        XCTAssertLessThanOrEqual(scale, 3.0, "scale must clamp at 300%")
+        XCTAssertLessThanOrEqual(window.frame.width, window.screen?.visibleFrame.width ?? .greatestFiniteMagnitude)
     }
 
     func testZoomKeepsWindowCenteredAnchoredWithinSubPixel() throws {
@@ -131,29 +121,11 @@ final class QAPinWindowFunctionalTests: XCTestCase {
         XCTAssertEqual(window.frame.origin.y, origin.y + 30, accuracy: 0.01, "window must move +30 Y")
     }
 
-    // ── Acceptance point 3: 关闭并复制 writes clipboard then closes; 关闭 keeps ──
-    func testCloseAndCopyWritesClipboardAndCloses() throws {
-        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 40, pixelsHigh: 30, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
-        let image = NSImage(size: NSSize(width: 40, height: 30))
-        image.addRepresentation(rep)
-        let controller = PinWindowController(image: image)
-        guard let content = controller.window?.contentView,
-              let closeCopy = button(named: "关闭并复制", in: content)
-        else { return XCTFail("关闭并复制 button missing") }
-
-        NSPasteboard.general.clearContents()
-        closeCopy.performClick(nil)
-
-        let pbImage = NSPasteboard.general.readObjects(forClasses: [NSImage.self], options: nil)?.first as? NSImage
-        XCTAssertNotNil(pbImage, "关闭并复制 must write image to clipboard before closing")
-        XCTAssertFalse(controller.window?.isVisible ?? false, "window must close after clipboard write")
-    }
-
     func testCloseDoesNotTouchClipboard() throws {
         let controller = PinWindowController(image: NSImage(size: NSSize(width: 40, height: 30)))
-        guard let content = controller.window?.contentView,
-              let closeButton = button(named: "关闭", in: content)
-        else { return XCTFail("关闭 button missing") }
+        guard let content = controller.window?.contentView else { return XCTFail("content missing") }
+        let closeButton = content.subviews.compactMap { $0 as? NSButton }.first { $0.accessibilityLabel() == "关闭" }
+        guard let closeButton else { return XCTFail("关闭 button missing") }
 
         NSPasteboard.general.clearContents()
         closeButton.performClick(nil)

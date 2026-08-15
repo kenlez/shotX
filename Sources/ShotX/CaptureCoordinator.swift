@@ -6,6 +6,7 @@ import ScreenCaptureKit
 enum CaptureOverlayLayout {
     static let edgeInset: CGFloat = 8
     static let optionsWidth: CGFloat = 300
+    static let optionsPanelLevel = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
 
     static func toolbarUsesTwoLines(fixedWidth: CGFloat, visibleWidth: CGFloat) -> Bool {
         fixedWidth + edgeInset * 2 > visibleWidth
@@ -89,6 +90,27 @@ enum AccessibilityAnnouncements {
 final class CaptureCoordinator {
     static let shared = CaptureCoordinator()
     private var overlays: [SelectionWindowController] = []
+    private weak var activeOverlay: SelectionWindowController?
+    private var screenTrackingTimer: Timer?
+
+    private func presentOverlays() {
+        NSApp.activate(ignoringOtherApps: true)
+        overlays.forEach { $0.window?.orderFrontRegardless() }
+        activateOverlay(at: NSEvent.mouseLocation)
+        screenTrackingTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.activateOverlay(at: NSEvent.mouseLocation) }
+        }
+    }
+
+    private func activateOverlay(at point: CGPoint) {
+        guard let index = Self.overlayIndex(at: point, frames: overlays.map { $0.window?.frame ?? .null }) else { return }
+        let target = overlays[index]
+        guard target !== activeOverlay else { return }
+        activeOverlay = target
+        overlays.forEach { $0.setActive($0 === target) }
+    }
+
+    static func overlayIndex(at point: CGPoint, frames: [CGRect]) -> Int? { frames.firstIndex { $0.contains(point) } }
 
     func begin(mode: CaptureMode, model: AppModel, targetScreen: NSScreen? = nil) async {
         cancel()
@@ -109,6 +131,7 @@ final class CaptureCoordinator {
     }
 
     private func showRegionSelection(content: SCShareableContent, model: AppModel, targetScreen: NSScreen?) async throws {
+        let windows = captureWindows(in: content)
         for screen in targetScreen.map({ [$0] }) ?? NSScreen.screens {
             guard let display = display(for: screen, in: content) else { continue }
             let filter = SCContentFilter(display: display, excludingWindows: [])
@@ -118,21 +141,11 @@ final class CaptureCoordinator {
             config.showsCursor = false
             config.captureResolution = .best
             let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-            let controller = SelectionWindowController(screen: screen, mode: .region, frozenImage: image, model: model)
-            controller.onCancel = { [weak self] in self?.cancel() }
-            controller.onEditing = { [weak self, weak controller] in
-                guard let self, let controller else { return }
-                overlays.filter { $0 !== controller }.forEach { $0.close() }
-                overlays = [controller]
-            }
-            controller.onCommit = { [weak self, weak model] image in
-                guard let self, let model else { return }
-                model.recentResult = .image(image)
-                self.cancel()
-            }
+            let controller = SelectionWindowController(screen: screen, mode: .region, windows: windows, frozenImage: image, model: model)
+            configureRegionController(controller, display: display, screen: screen, model: model)
             overlays.append(controller)
-            controller.showWindow(nil)
         }
+        presentOverlays()
         NSCursor.crosshair.push()
     }
 
@@ -163,30 +176,32 @@ final class CaptureCoordinator {
                 }
             }
             overlays.append(controller)
-            controller.showWindow(nil)
         }
+        presentOverlays()
         NSCursor.crosshair.push()
     }
 
     private func showWindowSelection(content: SCShareableContent, model: AppModel) {
-        let candidates = content.windows.filter { window in
-            window.isOnScreen && window.windowLayer == 0 && window.owningApplication?.bundleIdentifier != Bundle.main.bundleIdentifier && window.frame.width > 40 && window.frame.height > 40
-        }
+        let candidates = captureWindows(in: content)
         for screen in NSScreen.screens {
+            guard let display = display(for: screen, in: content) else { continue }
             let controller = SelectionWindowController(screen: screen, mode: .window, windows: candidates)
             controller.onCancel = { [weak self] in self?.cancel() }
             controller.onWindow = { [weak self, weak model] window in
                 guard let self, let model else { return }
                 self.cancel()
-                Task { await self.capture(window: window, model: model) }
+                Task { await self.edit(window: window, display: display, screen: screen, model: model) }
             }
             overlays.append(controller)
-            controller.showWindow(nil)
         }
+        presentOverlays()
         NSCursor.pointingHand.push()
     }
 
     func cancel() {
+        screenTrackingTimer?.invalidate()
+        screenTrackingTimer = nil
+        activeOverlay = nil
         if !overlays.isEmpty { NSCursor.pop() }
         overlays.forEach { $0.close() }
         overlays.removeAll()
@@ -213,22 +228,57 @@ final class CaptureCoordinator {
         catch { model.showError("截图失败。结果未创建，请重新选择。") }
     }
 
-    private func capture(window: SCWindow, model: AppModel) async {
-        let filter = SCContentFilter(desktopIndependentWindow: window)
+    private func edit(window selectedWindow: SCWindow, display: SCDisplay, screen: NSScreen, model: AppModel) async {
+        let filter = SCContentFilter(display: display, excludingWindows: [])
         let config = SCStreamConfiguration()
-        config.ignoreShadowsSingleWindow = !model.settings.windowShadow
+        config.width = max(1, Int((screen.frame.width * screen.backingScaleFactor).rounded()))
+        config.height = max(1, Int((screen.frame.height * screen.backingScaleFactor).rounded()))
         config.captureResolution = .best
         config.showsCursor = false
-        let scale = CGFloat(filter.pointPixelScale)
-        config.width = max(1, Int((filter.contentRect.width * scale).rounded()))
-        config.height = max(1, Int((filter.contentRect.height * scale).rounded()))
-        do { model.accept(try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)) }
-        catch { model.showError("窗口截图失败。结果未创建，请重试。") }
+        do {
+            let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            let selection = Self.localRect(windowFrame: selectedWindow.frame, screenFrame: screen.frame).intersection(CGRect(origin: .zero, size: screen.frame.size))
+            guard selection.width >= 1, selection.height >= 1 else { throw CaptureError.noContent }
+            let controller = SelectionWindowController(screen: screen, mode: .region, frozenImage: image, model: model, initialSelection: selection)
+            configureRegionController(controller, display: display, screen: screen, model: model)
+            overlays = [controller]
+            NSCursor.crosshair.push()
+            presentOverlays()
+        } catch { model.showError("窗口截图失败。结果未创建，请重试。") }
+    }
+
+    nonisolated static func localRect(windowFrame: CGRect, screenFrame: CGRect, primaryHeight: CGFloat = CGDisplayBounds(CGMainDisplayID()).height) -> CGRect {
+        CGRect(x: windowFrame.minX - screenFrame.minX, y: primaryHeight - windowFrame.maxY - screenFrame.minY, width: windowFrame.width, height: windowFrame.height)
+    }
+
+    private func configureRegionController(_ controller: SelectionWindowController, display: SCDisplay, screen: NSScreen, model: AppModel) {
+        controller.onCancel = { [weak self] in self?.cancel() }
+        controller.onEditing = { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            overlays.filter { $0 !== controller }.forEach { $0.close() }
+            overlays = [controller]
+        }
+        controller.onScrolling = { [weak self, weak model] rect in
+            guard let self, let model else { return }
+            self.cancel()
+            Task { await ScrollingCaptureCoordinator.shared.start(display: display, screen: screen, localRect: rect, model: model) }
+        }
+        controller.onCommit = { [weak self, weak model] image in
+            guard let self, let model else { return }
+            model.recentResult = .image(image)
+            self.cancel()
+        }
     }
 
     private func display(for screen: NSScreen, in content: SCShareableContent) -> SCDisplay? {
         guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
         return content.displays.first { $0.displayID == number.uint32Value }
+    }
+
+    private func captureWindows(in content: SCShareableContent) -> [SCWindow] {
+        content.windows.filter {
+            $0.isOnScreen && $0.windowLayer == 0 && $0.owningApplication?.bundleIdentifier != Bundle.main.bundleIdentifier && $0.frame.width > 40 && $0.frame.height > 40
+        }
     }
 }
 
@@ -242,18 +292,23 @@ final class SelectionWindowController: NSWindowController {
     var onWindow: ((SCWindow) -> Void)?
     var onCommit: ((NSImage) -> Void)?
     var onEditing: (() -> Void)?
+    var onScrolling: ((CGRect) -> Void)?
 
     private let view: SelectionView
 
-    init(screen: NSScreen, mode: CaptureMode, windows: [SCWindow] = [], frozenImage: CGImage? = nil, model: AppModel? = nil) {
-        let window = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false, screen: screen)
+    init(screen: NSScreen, mode: CaptureMode, windows: [SCWindow] = [], frozenImage: CGImage? = nil, model: AppModel? = nil, initialSelection: CGRect? = nil) {
+        let window = SelectionWindow(contentRect: CGRect(origin: .zero, size: screen.frame.size), styleMask: .borderless, backing: .buffered, defer: false, screen: screen)
         window.level = .screenSaver
         window.backgroundColor = .clear
         window.isOpaque = false
         window.hasShadow = false
+        window.isMovable = false
+        window.isMovableByWindowBackground = false
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.ignoresMouseEvents = false
-        view = SelectionView(frame: CGRect(origin: .zero, size: screen.frame.size), mode: mode, screen: screen, windows: windows, frozenImage: frozenImage, model: model)
+        window.acceptsMouseMovedEvents = true
+        window.sharingType = .none
+        view = SelectionView(frame: CGRect(origin: .zero, size: screen.frame.size), mode: mode, screen: screen, windows: windows, frozenImage: frozenImage, model: model, initialSelection: initialSelection)
         super.init(window: window)
         view.onCancel = { [weak self] in self?.onCancel?() }
         view.onSelection = { [weak self] in self?.onSelection?($0) }
@@ -261,13 +316,22 @@ final class SelectionWindowController: NSWindowController {
         view.onWindow = { [weak self] in self?.onWindow?($0) }
         view.onCommit = { [weak self] in self?.onCommit?($0) }
         view.onEditing = { [weak self] in self?.onEditing?() }
+        view.onScrolling = { [weak self] in self?.onScrolling?($0) }
         window.contentView = view
         window.makeFirstResponder(view)
+        if initialSelection != nil { DispatchQueue.main.async { [weak view] in view?.beginPresetEditing() } }
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
     var selectionRect: CGRect { view.selectionRect }
+
+    func setActive(_ active: Bool) {
+        window?.ignoresMouseEvents = !active
+        guard active else { return }
+        window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(view)
+    }
 
     func enterRecordingSetup(onChanged: @escaping (CGRect) -> Void, onExit: @escaping () -> Void) {
         view.onSelectionChanged = onChanged
@@ -283,6 +347,10 @@ final class SelectionWindowController: NSWindowController {
 
     func hideForCountdown() { window?.orderOut(nil) }
     func showForSetup() { window?.orderFrontRegardless() }
+}
+
+private final class SelectionWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
 }
 
 enum RegionCapturePhase: Equatable {
@@ -331,11 +399,13 @@ final class SelectionView: NSView {
     var onQuickRecord: ((CGRect) -> Void)?
     var onSelectionChanged: ((CGRect) -> Void)?
     var onExitSetup: (() -> Void)?
+    var onScrolling: ((CGRect) -> Void)?
     private(set) var setupActive = false
     private let mode: CaptureMode
     private let targetScreen: NSScreen
     private let windows: [SCWindow]
     private var start: CGPoint?
+    private var selectingByDrag = false
     private var selection = CGRect.zero
     private var hoveredWindow: SCWindow?
     private var phase = RegionCapturePhase.selecting
@@ -343,15 +413,14 @@ final class SelectionView: NSView {
     private let frozenCG: CGImage?
     private weak var model: AppModel?
     private var editor: AnnotationView?
-    private var toolbar: NSVisualEffectView?
-    private var toolControl: NSSegmentedControl?
+    private var toolbar: NSView?
+    private var toolButtons: [NSButton] = []
     private var toolbarFixedSize = NSSize.zero
     private var optionsContentHeight: CGFloat = 120
     private var lastToolIndex = 0
     private let styleButton = NSButton(frame: .zero)
     private var optionsPanel: NSPanel?
-    private var optionsMonitor: Any?
-    private var optionsKeyMonitor: Any?
+    private weak var optionsTailView: NSImageView?
     private var memoryLabel: NSTextField?
     private var swatchButtons: [NSButton] = []
     private var brushSlider: BrushSlider?
@@ -374,8 +443,9 @@ final class SelectionView: NSView {
     private var undoStack: [RegionEditSnapshot] = []
     private var redoStack: [RegionEditSnapshot] = []
     private var pendingShareImage: NSImage?
+    private var shortcutMonitor: Any?
 
-    init(frame: CGRect, mode: CaptureMode, screen: NSScreen, windows: [SCWindow], frozenImage: CGImage? = nil, model: AppModel? = nil) {
+    init(frame: CGRect, mode: CaptureMode, screen: NSScreen, windows: [SCWindow], frozenImage: CGImage? = nil, model: AppModel? = nil, initialSelection: CGRect? = nil) {
         self.mode = mode
         targetScreen = screen
         self.windows = windows
@@ -383,15 +453,27 @@ final class SelectionView: NSView {
         self.frozenCG = frozenImage
         self.frozenImage = frozenImage.map { NSImage(cgImage: $0, size: screen.frame.size) }
         super.init(frame: frame)
+        if let initialSelection {
+            selection = initialSelection
+            phase = .editing
+        }
         wantsLayer = true
         addTrackingArea(NSTrackingArea(rect: bounds, options: [.activeAlways, .mouseMoved, .inVisibleRect], owner: self))
     }
 
     required init?(coder: NSCoder) { fatalError() }
+    deinit { if let shortcutMonitor { NSEvent.removeMonitor(shortcutMonitor) } }
     override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var isFlipped: Bool { false }
 
     var selectionRect: CGRect { selection }
+
+    func beginPresetEditing() {
+        guard mode == .region, phase == .editing, editor == nil else { return }
+        onEditing?()
+        beginRegionEditing()
+    }
 
     func enterRecordingSetup() {
         setupActive = true
@@ -405,6 +487,23 @@ final class SelectionView: NSView {
 
     private func notifySelectionChanged() { onSelectionChanged?(selection) }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil, shortcutMonitor == nil else { return }
+        shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, event.window === self.window || event.window === self.optionsPanel else { return event }
+            if self.editor?.isEditingText == true {
+                if event.keyCode == UInt16(kVK_Escape) { self.editor?.cancelTextEntry(); return nil }
+                return event
+            }
+            if event.keyCode == UInt16(kVK_Escape) || event.keyCode == UInt16(kVK_Space) {
+                self.keyDown(with: event)
+                return nil
+            }
+            return event
+        }
+    }
+
     override func keyDown(with event: NSEvent) {
         if event.keyCode == UInt16(kVK_Escape) {
             if setupActive { onExitSetup?(); return }
@@ -412,10 +511,7 @@ final class SelectionView: NSView {
                 stopEyeDropper()
                 return
             }
-            if optionsPanel?.isVisible == true {
-                hideOptionsPanel()
-                return
-            }
+            hideOptionsPanel()
             phase.discard(); onCancel?()
         }
         else if event.keyCode == UInt16(kVK_Space), mode == .region, phase == .editing {
@@ -425,6 +521,7 @@ final class SelectionView: NSView {
             quickRecord()
         }
         else if mode == .region, phase == .editing, event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "z" { event.modifierFlags.contains(.shift) ? redo() : undo() }
+        else if event.keyCode == UInt16(kVK_Return), mode == .region, phase == .selecting { acceptSuggestedSelection() }
         else if event.keyCode == UInt16(kVK_Return), mode.isDisplay { onSelection?(bounds) }
         else if event.keyCode == UInt16(kVK_Return), mode == .regionRecording, phase == .editing, !setupActive { onSelection?(selection) }
         else if event.keyCode == UInt16(kVK_Return), let hoveredWindow { onWindow?(hoveredWindow) }
@@ -432,11 +529,12 @@ final class SelectionView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        window?.makeKey()
         if mode == .window { if let hoveredWindow { onWindow?(hoveredWindow) }; return }
         if mode.isDisplay { onSelection?(bounds); return }
         let point = convert(event.locationInWindow, from: nil)
         if (mode == .region || mode == .regionRecording), phase == .editing {
-            if event.clickCount >= 2, mode == .region, editor?.tool == .select, selection.contains(point) {
+            if event.clickCount >= 2, mode == .region, selection.contains(point) {
                 quickCopy()
                 return
             }
@@ -449,7 +547,8 @@ final class SelectionView: NSView {
             return
         }
         start = point
-        selection = CGRect(origin: start!, size: .zero)
+        selectingByDrag = false
+        if mode != .region { selection = CGRect(origin: start!, size: .zero) }
         needsDisplay = true
     }
 
@@ -463,6 +562,10 @@ final class SelectionView: NSView {
         }
         guard let start else { return }
         let point = bounded(convert(event.locationInWindow, from: nil))
+        if mode == .region, phase == .selecting, !selectingByDrag {
+            selectingByDrag = hypot(point.x - start.x, point.y - start.y) >= 4
+            guard selectingByDrag else { return }
+        }
         selection = CGRect(x: min(start.x, point.x), y: min(start.y, point.y), width: abs(point.x - start.x), height: abs(point.y - start.y)).integral
         needsDisplay = true
     }
@@ -476,23 +579,41 @@ final class SelectionView: NSView {
         }
         guard start != nil else { return }
         start = nil
+        if mode == .region, phase == .selecting, !selectingByDrag { selection = suggestedSelection }
+        selectingByDrag = false
         if mode == .region || mode == .regionRecording {
             phase.release(validSelection: selection.width >= 1 && selection.height >= 1)
             if phase == .editing {
                 onEditing?()
                 if mode == .region { beginRegionEditing() }
-                else { window?.makeFirstResponder(self) }
+                else {
+                    window?.makeFirstResponder(self)
+                    onSelection?(selection)
+                }
             }
         } else if selection.width >= 1, selection.height >= 1 { onSelection?(selection) }
     }
 
     override func mouseMoved(with event: NSEvent) {
-        guard mode == .window else { return }
+        guard mode == .window || (mode == .region && phase == .selecting && start == nil) else { return }
         let local = convert(event.locationInWindow, from: nil)
         let appKitGlobal = CGPoint(x: targetScreen.frame.minX + local.x, y: targetScreen.frame.minY + local.y)
-        let cgPoint = CGPoint(x: appKitGlobal.x, y: NSScreen.screens[0].frame.height - appKitGlobal.y)
+        let cgPoint = CGPoint(x: appKitGlobal.x, y: CGDisplayBounds(CGMainDisplayID()).height - appKitGlobal.y)
         hoveredWindow = windows.first { $0.frame.contains(cgPoint) }
         needsDisplay = true
+    }
+
+    private var suggestedSelection: CGRect {
+        guard let hoveredWindow else { return bounds }
+        return CaptureCoordinator.localRect(windowFrame: hoveredWindow.frame, screenFrame: targetScreen.frame).intersection(bounds)
+    }
+
+    private func acceptSuggestedSelection() {
+        selection = suggestedSelection
+        phase.release(validSelection: selection.width >= 1 && selection.height >= 1)
+        guard phase == .editing else { return }
+        onEditing?()
+        beginRegionEditing()
     }
 
     private func bounded(_ point: CGPoint) -> CGPoint { CGPoint(x: min(max(0, point.x), bounds.maxX), y: min(max(0, point.y), bounds.maxY)) }
@@ -502,9 +623,11 @@ final class SelectionView: NSView {
         NSColor.black.withAlphaComponent(setupActive ? 0.28 : 0.45).setFill()
         let shade = NSBezierPath(rect: bounds)
         let focus: CGRect
-        if mode == .window, let hoveredWindow {
+        if mode == .region, phase == .selecting, !selectingByDrag {
+            focus = suggestedSelection
+        } else if mode == .window, let hoveredWindow {
             let global = hoveredWindow.frame
-            focus = CGRect(x: global.minX - targetScreen.frame.minX, y: NSScreen.screens[0].frame.height - global.maxY - targetScreen.frame.minY, width: global.width, height: global.height).intersection(bounds)
+            focus = CaptureCoordinator.localRect(windowFrame: global, screenFrame: targetScreen.frame).intersection(bounds)
         } else if mode.isDisplay { focus = bounds.insetBy(dx: 4, dy: 4) }
         else { focus = selection }
         if !focus.isEmpty {
@@ -515,34 +638,27 @@ final class SelectionView: NSView {
             if setupActive {
                 drawSetupBorder(around: focus)
             } else {
-                NSColor.controlAccentColor.setStroke()
-                let path = NSBezierPath(rect: focus)
+                NSColor(hex: "#10AEFF")!.setStroke()
+                let styledFocus = focus.insetBy(dx: 3, dy: 3)
+                let path = NSBezierPath(roundedRect: styledFocus, xRadius: 8, yRadius: 8)
                 path.lineWidth = mode.isDisplay ? 3 : 2
                 path.stroke()
             }
-            if (mode == .region || mode == .regionRecording), phase == .editing { drawHandles(around: focus) }
+            if (mode == .region || mode == .regionRecording), phase == .editing { drawHandles(around: focus.insetBy(dx: 3, dy: 3)) }
         }
         drawLabel(focus: focus)
     }
 
     private func drawSetupBorder(around rect: CGRect) {
-        NSColor.black.setStroke()
-        let outer = NSBezierPath(rect: rect.insetBy(dx: 0.5, dy: 0.5)); outer.lineWidth = 3; outer.stroke()
-        NSColor.white.setStroke()
-        let inner = NSBezierPath(rect: rect.insetBy(dx: 2, dy: 2)); inner.lineWidth = 2; inner.stroke()
-        for (x, y, sx, sy) in [(3.0, 3.0, 1.0, 1.0), (rect.maxX - 3, rect.minY + 3, -1, 1), (rect.minX + 3, rect.maxY - 3, 1, -1), (rect.maxX - 3, rect.maxY - 3, -1, -1)] {
-            let path = NSBezierPath()
-            path.move(to: CGPoint(x: x + 16 * sx, y: y))
-            path.line(to: CGPoint(x: x, y: y))
-            path.line(to: CGPoint(x: x, y: y + 16 * sy))
-            path.lineWidth = 3
-            path.stroke()
-        }
+        NSColor(hex: "#07C160")!.setStroke()
+        let styledRect = rect.insetBy(dx: 3, dy: 3)
+        let border = NSBezierPath(roundedRect: styledRect, xRadius: 8, yRadius: 8); border.lineWidth = 1; border.stroke()
+        drawSelectionAccents(around: styledRect, color: NSColor(hex: "#07C160")!)
     }
 
     private func drawLabel(focus: CGRect) {
         let scale = targetScreen.backingScaleFactor
-        let showSize = !focus.isEmpty && !CaptureFocusChain.isTiny(selection)
+        let showSize = !focus.isEmpty && !CaptureFocusChain.isTiny(focus)
         let size = showSize ? "  ·  \(Int((focus.width * scale).rounded())) × \(Int((focus.height * scale).rounded())) px" : ""
         let hint: String
         if setupActive {
@@ -554,7 +670,8 @@ final class SelectionView: NSView {
         } else {
             hint = "  ·  Esc 取消"
         }
-        let text = "\(setupActive ? "录制区域" : mode.rawValue)\(size)\(hint)"
+        let title = mode == .region ? "截图" : mode.rawValue
+        let text = "\(setupActive ? "录制区域" : title)\(size)\(hint)"
         let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedSystemFont(ofSize: 13, weight: .medium), .foregroundColor: NSColor.white]
         let string = NSAttributedString(string: text, attributes: attributes)
         let textSize = string.size()
@@ -572,7 +689,7 @@ final class SelectionView: NSView {
         editor.onEscape = { [weak self] in
             guard let self else { return }
             if self.eyedropperWindow != nil { self.stopEyeDropper(); return }
-            if self.optionsPanel?.isVisible == true { self.hideOptionsPanel(); return }
+            self.hideOptionsPanel()
             self.phase.discard(); self.onCancel?()
         }
         editor.onUndo = { [weak self] in self?.undo() }
@@ -583,6 +700,9 @@ final class SelectionView: NSView {
         editor.onSelectionDragEnded = { [weak self] in self?.endSelectionMove() }
         editor.onDoubleClick = { [weak self] in self?.quickCopy() }
         self.editor = editor
+        editor.layer?.borderColor = NSColor(hex: "#10AEFF")?.cgColor
+        editor.layer?.borderWidth = 2
+        editor.layer?.cornerRadius = 8
         addSubview(editor)
         updateEditorFrame()
         makeSelectionFocusTargets()
@@ -593,41 +713,87 @@ final class SelectionView: NSView {
     }
 
     private func makeToolbar() {
-        let tools = NSSegmentedControl(labels: AnnotationTool.allCases.map(\.rawValue), trackingMode: .selectOne, target: self, action: #selector(toolChanged(_:)))
-        tools.selectedSegment = 0
-        tools.controlSize = .small
-        for index in 0..<tools.segmentCount { tools.setWidth(32, forSegment: index) }
-        toolControl = tools
-        styleButton.target = self; styleButton.action = #selector(stylePressed); styleButton.setAccessibilityLabel("样式"); styleButton.toolTip = "样式"
-        styleButton.controlSize = .small
-        styleButton.widthAnchor.constraint(equalToConstant: 72).isActive = true
-        let undo = button("撤销", #selector(undoPressed)); undo.controlSize = .small
-        let redo = button("重做", #selector(redoPressed)); redo.controlSize = .small
-        let editButtons = [tools, undo, redo, styleButton]
-        let outputButtons = [button("复制", #selector(copyPressed)), button("保存…", #selector(savePressed)), button("分享…", #selector(sharePressed)), button("贴图", #selector(pinPressed)), button("关闭", #selector(closePressed))]
-        toolbarControls = [tools, undo, redo, styleButton]
-        outputControls = outputButtons
-        outputButtons.forEach { $0.controlSize = .small }
-        let toolRow = NSStackView(views: editButtons); toolRow.orientation = .horizontal; toolRow.spacing = 4; toolRow.alignment = .centerY
-        let outputRow = NSStackView(views: outputButtons); outputRow.orientation = .horizontal; outputRow.spacing = 4; outputRow.alignment = .centerY
-        let toolbar = NSVisualEffectView(frame: .zero); toolbar.material = .hudWindow; toolbar.state = .active; toolbar.wantsLayer = true; toolbar.layer?.cornerRadius = 10
-        let content = NSStackView(views: [toolRow, outputRow])
-        content.spacing = 4; content.alignment = .centerY
-        let twoLines = CaptureOverlayLayout.toolbarUsesTwoLines(fixedWidth: toolRow.fittingSize.width + outputRow.fittingSize.width + 7 + 20, visibleWidth: targetScreen.visibleFrame.width)
-        content.orientation = twoLines ? .vertical : .horizontal
+        toolButtons = AnnotationTool.allCases.enumerated().map { index, tool in
+            let button = NSButton(image: Self.figmaIcon(Self.toolbarIconName(for: tool), tint: NSColor(hex: index == 0 ? "#10AEFF" : "#D9D9D9")), target: self, action: #selector(toolChanged(_:)))
+            button.tag = index; button.isBordered = false; button.imagePosition = .imageOnly; button.widthAnchor.constraint(equalToConstant: 22).isActive = true; button.heightAnchor.constraint(equalToConstant: 22).isActive = true; button.setAccessibilityLabel(tool.rawValue); button.toolTip = tool.rawValue
+            return button
+        }
+        let tools = NSStackView(views: toolButtons); tools.orientation = .horizontal; tools.spacing = 16; tools.alignment = .centerY
+        updateToolIcons(selected: 0)
+        let undo = iconButton("undo", "撤销", #selector(undoPressed))
+        let close = iconButton("close", "关闭", #selector(closePressed), tint: NSColor(hex: "#FA5151"))
+        let longShot = iconButton("long-shot", "滚动截图", #selector(scrollingPressed))
+        let pin = iconButton("pin", "贴图", #selector(pinPressed))
+        let save = iconButton("save", "保存", #selector(savePressed))
+        let copy = iconButton("copy", "复制", #selector(copyPressed))
+        let divider1 = divider(), divider2 = divider(), divider3 = divider()
+        let toolbarItems: [NSView] = toolButtons.map { $0 as NSView } + [divider1, undo, close, divider2, longShot, divider3, pin, save, copy]
+        toolbarControls = toolButtons + [undo, close, longShot]
+        outputControls = [pin, save, copy]
+        let toolRow = NSStackView(views: toolbarItems); toolRow.orientation = .horizontal; toolRow.spacing = 16; toolRow.alignment = .centerY
+        toolRow.setCustomSpacing(15, after: divider1); toolRow.setCustomSpacing(15, after: divider2); toolRow.setCustomSpacing(15, after: divider3)
+        let toolbar = NSView(frame: .zero); toolbar.wantsLayer = true; toolbar.layer?.cornerRadius = 12; toolbar.layer?.backgroundColor = NSColor(hex: "#333333")?.cgColor; toolbar.layer?.shadowColor = NSColor.black.cgColor; toolbar.layer?.shadowOpacity = 0.16; toolbar.layer?.shadowRadius = 4; toolbar.layer?.shadowOffset = CGSize(width: 0, height: -4)
+        let content = toolRow
+        let twoLines = CaptureOverlayLayout.toolbarUsesTwoLines(fixedWidth: 638, visibleWidth: targetScreen.visibleFrame.width)
         toolbar.addSubview(content)
         content.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([content.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 10), content.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -10), content.topAnchor.constraint(equalTo: toolbar.topAnchor, constant: 4), content.bottomAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: -4)])
+        NSLayoutConstraint.activate([content.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 18), content.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -18), content.topAnchor.constraint(equalTo: toolbar.topAnchor, constant: 12), content.bottomAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: -12)])
         toolbar.layoutSubtreeIfNeeded()
-        updateStyleControls(for: .select)
+        editor?.tool = .move
+        updateStyleControls(for: .move)
         toolbar.layoutSubtreeIfNeeded()
         let visible = targetScreen.visibleFrame.offsetBy(dx: -targetScreen.frame.minX, dy: -targetScreen.frame.minY)
-        toolbarFixedSize = CaptureOverlayLayout.toolbarSize(toolbar.fittingSize, visibleFrame: visible)
-        toolbarFixedSize.height = twoLines ? 80 : 40
+        toolbarFixedSize = CaptureOverlayLayout.toolbarSize(NSSize(width: 638, height: twoLines ? 92 : 46), visibleFrame: visible)
         addSubview(toolbar); self.toolbar = toolbar
         positionToolbar()
         updateFocusChain()
     }
+
+    private func iconButton(_ asset: String, _ label: String, _ action: Selector, tint: NSColor? = NSColor(hex: "#D9D9D9")) -> NSButton {
+        let button = NSButton(image: Self.figmaIcon(asset), target: self, action: action)
+        button.isBordered = false; button.imageScaling = .scaleProportionallyDown; button.contentTintColor = tint
+        button.widthAnchor.constraint(equalToConstant: 22).isActive = true; button.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        button.setAccessibilityLabel(label); button.toolTip = label
+        return button
+    }
+
+    private func divider() -> NSView {
+        let view = NSView(); view.wantsLayer = true; view.layer?.backgroundColor = NSColor(hex: "#777777")?.cgColor
+        view.widthAnchor.constraint(equalToConstant: 1).isActive = true; view.heightAnchor.constraint(equalToConstant: 12).isActive = true
+        return view
+    }
+
+    private static func figmaIcon(_ name: String, size: NSSize = NSSize(width: 22, height: 22), tint: NSColor? = nil) -> NSImage {
+        let packaged = Bundle.main.resourceURL?.appendingPathComponent("ShotX_ShotX.bundle")
+        let bundle = packaged.flatMap(Bundle.init(url:)) ?? Bundle.module
+        guard let url = bundle.url(forResource: name, withExtension: "svg") else { return NSImage(size: size) }
+        if let tint, let svg = try? String(contentsOf: url, encoding: .utf8), let data = svg.replacingOccurrences(of: "#D9D9D9", with: tint.hex).data(using: .utf8), let image = NSImage(data: data) { return image.shotXSized(size) }
+        guard let image = NSImage(contentsOf: url) else { return NSImage(size: size) }
+        return image.shotXSized(size)
+    }
+
+    private func updateToolIcons(selected: Int) {
+        for (index, tool) in AnnotationTool.allCases.enumerated() {
+            let tint = NSColor(hex: index == selected ? "#10AEFF" : "#D9D9D9")!
+            toolButtons[index].image = Self.figmaIcon(Self.toolbarIconName(for: tool), tint: tint)
+        }
+    }
+
+    private static func toolbarIconName(for tool: AnnotationTool) -> String {
+        switch tool {
+        case .move: "move"
+        case .rectangle: "rectangle"
+        case .ellipse: "circle"
+        case .line: "line"
+        case .arrow: "arrow"
+        case .pen: "pen"
+        case .mosaic: "mosaic"
+        case .text: "text"
+        case .crop: "annotation"
+        }
+    }
+
+    @objc private func scrollingPressed() { guard selection.width >= 1, selection.height >= 1 else { return }; hideOptionsPanel(animated: true); onScrolling?(selection) }
 
     private func makeSelectionFocusTargets() {
         let selectionTarget = SelectionFocusTarget(frame: selection)
@@ -716,107 +882,118 @@ final class SelectionView: NSView {
 
     private func button(_ title: String, _ action: Selector) -> NSButton { NSButton(title: title, target: self, action: action) }
 
-    @objc private func toolChanged(_ sender: NSSegmentedControl) {
-        let index = sender.selectedSegment
+    @objc private func toolChanged(_ sender: NSButton) {
+        let index = sender.tag
         let tool = AnnotationTool.allCases[index]
-        if index == lastToolIndex, AnnotationTool.styledCases.contains(tool), optionsPanel?.isVisible == true {
-            hideOptionsPanel()
-            return
-        }
         lastToolIndex = index
+        updateToolIcons(selected: index)
         editor?.tool = tool
         updateStyleControls(for: tool)
+        window?.makeKey()
+        window?.makeFirstResponder(editor)
         if AnnotationTool.styledCases.contains(tool) {
             if optionsPanel?.isVisible == true { rebuildOptionsPanel() } else { showOptionsPanel() }
         } else {
-            hideOptionsPanel()
+            hideOptionsPanel(animated: true)
         }
-        if optionsPanel?.isVisible != true { window?.makeFirstResponder(editor) }
     }
 
     @objc private func stylePressed() {
         guard let editor, AnnotationTool.styledCases.contains(editor.tool) else { return }
-        if optionsPanel?.isVisible == true { hideOptionsPanel() } else { showOptionsPanel() }
+        if optionsPanel?.isVisible != true { showOptionsPanel() }
     }
 
     private func showOptionsPanel() {
-        hideOptionsPanel()
-        let panel = OptionsPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 220), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        if optionsPanel != nil { rebuildOptionsPanel(); return }
+        let width: CGFloat = editor?.tool == .text ? 200 : 152
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: 72), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
-        panel.level = .screenSaver
+        panel.level = CaptureOverlayLayout.optionsPanelLevel
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
+        panel.isMovable = false
+        panel.isMovableByWindowBackground = false
+        panel.sharingType = .none
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.alphaValue = 1
         let content = makeOptionsContent()
         panel.contentView = content
-        panel.setContentSize(CaptureOverlayLayout.optionsPanelSize(contentHeight: optionsContentHeight, visibleFrame: targetScreen.visibleFrame))
+        panel.setContentSize(NSSize(width: width, height: 72))
         optionsPanel = panel
         positionOptionsPanel()
-        panel.makeKeyAndOrderFront(nil)
-        panel.makeFirstResponder(optionsControls.first)
+        panel.orderFrontRegardless()
         updateFocusChain()
         AccessibilityAnnouncements.post("样式，颜色和粗细", on: panel)
-        installOptionsMonitors()
     }
 
     private func rebuildOptionsPanel() {
-        guard let panel = optionsPanel else { return }
-        let content = makeOptionsContent()
-        panel.contentView = content
-        panel.setContentSize(CaptureOverlayLayout.optionsPanelSize(contentHeight: optionsContentHeight, visibleFrame: targetScreen.visibleFrame))
-        positionOptionsPanel()
+        guard let panel = optionsPanel else { showOptionsPanel(); return }
+        let width: CGFloat = editor?.tool == .text ? 200 : 152
+        panel.alphaValue = 1
+        panel.contentView = makeOptionsContent()
+        panel.setContentSize(NSSize(width: width, height: 72))
+        positionOptionsPanel(animated: true)
+        panel.orderFrontRegardless()
         updateFocusChain()
     }
 
-    private func hideOptionsPanel() {
-        if let monitor = optionsMonitor { NSEvent.removeMonitor(monitor) }
-        optionsMonitor = nil
-        if let monitor = optionsKeyMonitor { NSEvent.removeMonitor(monitor) }
-        optionsKeyMonitor = nil
-        optionsPanel?.orderOut(nil)
+    private func hideOptionsPanel(animated: Bool = false) {
+        guard let panel = optionsPanel else { return }
         optionsPanel = nil
         updateFocusChain()
         window?.makeKey()
-        window?.makeFirstResponder(styleButton)
-    }
-
-    private func installOptionsMonitors() {
-        optionsMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
-            guard let self, let panel = self.optionsPanel, panel.isVisible else { return event }
-            let point = event.window?.convertToScreen(NSRect(origin: event.locationInWindow, size: .zero)).origin ?? NSEvent.mouseLocation
-            if panel.frame.contains(point) { return event }
-            if self.toolbar.map({ self.window?.convertToScreen($0.convert($0.bounds, to: nil)) ?? .zero })?.contains(point) == true { return event }
-            self.hideOptionsPanel()
-            return event
+        window?.makeFirstResponder(editor)
+        guard animated else { panel.orderOut(nil); return }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.2
+            panel.animator().alphaValue = 0
         }
-        optionsKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, event.keyCode == 53, self.optionsPanel?.isVisible == true else { return event }
-            self.hideOptionsPanel()
-            return nil
-        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { panel.orderOut(nil) }
     }
 
     private func makeOptionsContent() -> NSView {
         guard let tool = editor?.tool else { return NSView() }
         optionsControls = []
-        let content = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 300, height: 220))
-        content.material = .hudWindow; content.state = .active; content.wantsLayer = true; content.layer?.cornerRadius = 10
-        var sections: [NSView] = [makeMemoryRow(for: tool)]
-        if tool != .mosaic { sections.append(makeColorSection()) }
-        sections.append(makeSizeSection(for: tool))
-        let root = NSStackView(views: sections)
-        root.orientation = .vertical; root.spacing = 8; root.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
-        root.layoutSubtreeIfNeeded()
-        root.frame = NSRect(origin: .zero, size: NSSize(width: CaptureOverlayLayout.optionsWidth - 20, height: root.fittingSize.height))
-        optionsContentHeight = root.frame.height + 20
-        let scroll = NSScrollView()
-        scroll.documentView = root; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true; scroll.drawsBackground = false
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(scroll)
-        NSLayoutConstraint.activate([scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10), scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10), scroll.topAnchor.constraint(equalTo: content.topAnchor, constant: 10), scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -10)])
+        let width: CGFloat = tool == .text ? 200 : 152
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 72)); content.wantsLayer = true
+        let body = CAShapeLayer(); body.fillColor = NSColor(hex: "#333333")?.cgColor; body.path = CGPath(roundedRect: CGRect(x: 0, y: 0, width: width, height: 60), cornerWidth: 30, cornerHeight: 30, transform: nil); content.layer?.addSublayer(body)
+        let tail = NSImageView(image: Self.figmaIcon("drop-over-tail", size: NSSize(width: 16, height: 9.59167))); tail.imageScaling = .scaleAxesIndependently; content.addSubview(tail); optionsTailView = tail; updateOptionsTail(anchorX: width / 2, width: width)
+        let size = SizeDotControl(frame: NSRect(x: 16, y: 14, width: 32, height: 32)); size.minValue = tool.styleRange.min; size.maxValue = tool.styleRange.max; size.doubleValue = currentSize(for: tool); size.target = self; size.action = #selector(sizeDotChanged(_:)); size.setAccessibilityLabel(tool.styleLabel); content.addSubview(size); optionsControls.append(size)
+        let firstDivider = divider(); firstDivider.frame = NSRect(x: 56, y: 24, width: 1, height: 12); content.addSubview(firstDivider)
+        var colorsX: CGFloat = 64
+        if tool == .text {
+            let names = ["text-style-normal", "text-style-outline-1", "text-style-outline-2", "text-style-highlight"]
+            let textStyle = NSButton(image: Self.figmaIcon(names[editor?.textStyle.rawValue ?? 0], size: NSSize(width: 32, height: 32)), target: self, action: #selector(cycleTextStyle(_:))); textStyle.isBordered = false; textStyle.imagePosition = .imageOnly; textStyle.frame = NSRect(x: 64, y: 14, width: 32, height: 32); textStyle.setAccessibilityLabel("字符样式"); content.addSubview(textStyle); optionsControls.append(textStyle)
+            let secondDivider = divider(); secondDivider.frame = NSRect(x: 104, y: 24, width: 1, height: 12); content.addSubview(secondDivider); colorsX = 112
+        }
+        swatchButtons = []
+        for (index, color) in Self.figmaColors.enumerated() {
+            let button = NSButton(title: "", target: self, action: #selector(figmaPresetPicked(_:))); button.isBordered = false; button.tag = index
+            button.image = Self.figmaSwatchImage(color, selected: color.hex == currentAnnotationColor.hex); button.imagePosition = .imageOnly
+            button.frame = NSRect(x: colorsX + CGFloat(index % 3) * 25, y: index < 3 ? 30 : 8, width: 22, height: 22); content.addSubview(button); swatchButtons.append(button); optionsControls.append(button)
+        }
+        optionsContentHeight = 60
         return content
     }
+
+    @objc private func sizeDotChanged(_ sender: SizeDotControl) {
+        guard let tool = editor?.tool else { return }
+        editor?.applyStyleLive(color: currentAnnotationColor, size: sender.doubleValue); model?.settings.annotationSizes[tool.rawValue] = sender.doubleValue; model?.persist(); updateStyleButton()
+    }
+
+    @objc private func cycleTextStyle(_ sender: NSButton) {
+        guard let editor else { return }
+        let next = AnnotationTextStyle(rawValue: (editor.textStyle.rawValue + 1) % AnnotationTextStyle.allCases.count) ?? .normal
+        editor.setTextStyle(next)
+        let names = ["text-style-normal", "text-style-outline-1", "text-style-outline-2", "text-style-highlight"]
+        sender.image = Self.figmaIcon(names[next.rawValue], size: NSSize(width: 32, height: 32))
+        sender.setAccessibilityValue(["正常字符", "描边字符", "颜色颠倒的描边", "高亮"][next.rawValue])
+    }
+
+    @objc private func figmaPresetPicked(_ sender: NSButton) { guard Self.figmaColors.indices.contains(sender.tag) else { return }; applyPickedColor(Self.figmaColors[sender.tag]) }
 
     private func makeMemoryRow(for tool: AnnotationTool) -> NSView {
         let label = NSTextField(labelWithString: "")
@@ -919,7 +1096,6 @@ final class SelectionView: NSView {
     }
 
     @objc private func eyedropperPressed() {
-        hideOptionsPanel()
         startEyeDropper()
     }
 
@@ -1094,7 +1270,7 @@ final class SelectionView: NSView {
     }
     @objc private func savePressed() {
         guard let image = renderOutput(), let data = image.pngData, let window else { return }
-        let panel = NSSavePanel(); panel.allowedContentTypes = [.png]; panel.nameFieldStringValue = "ShotX-\(Self.timestamp()).png"
+        let panel = NSSavePanel(); panel.allowedContentTypes = [.png]; panel.nameFieldStringValue = ShotXOutputName.make(extension: "png")
         if let path = model?.settings.lastSaveDirectory { panel.directoryURL = URL(fileURLWithPath: path) }
         panel.beginSheetModal(for: window) { [weak self] response in
             guard let self, response == .OK, let url = panel.url else { return }
@@ -1108,8 +1284,8 @@ final class SelectionView: NSView {
         let picker = NSSharingServicePicker(items: [image]); picker.delegate = self; picker.show(relativeTo: toolbar.bounds, of: toolbar, preferredEdge: .minY)
     }
     @objc private func pinPressed() { guard let image = renderOutput() else { return }; PinWindowController.show(image); commit(image) }
-    private func renderOutput() -> NSImage? { hideOptionsPanel(); return editor?.render() }
-    private func commit(_ image: NSImage) { phase.commit(); onCommit?(image) }
+    private func renderOutput() -> NSImage? { editor?.render() }
+    private func commit(_ image: NSImage) { hideOptionsPanel(); phase.commit(); onCommit?(image) }
 
     private func updateStyleControls(for tool: AnnotationTool) {
         currentAnnotationColor = NSColor(hex: model?.settings.annotationColors[tool.rawValue] ?? "#FF3B30") ?? .systemRed
@@ -1137,10 +1313,11 @@ final class SelectionView: NSView {
         styleButton.setAccessibilityLabel("样式 \(styleButton.title)")
     }
     private func updateColorButtons() {
-        for (index, button) in swatchButtons.enumerated() where index < Self.presetColors.count {
-            let color = Self.presetColors[index]
+        let colors = swatchButtons.count == Self.figmaColors.count ? Self.figmaColors : Self.presetColors
+        for (index, button) in swatchButtons.enumerated() where index < colors.count {
+            let color = colors[index]
             let selected = color.hex == currentAnnotationColor.hex
-            button.image = Self.swatchImage(color, size: NSSize(width: 20, height: 16), selected: selected)
+            button.image = colors.count == Self.figmaColors.count ? Self.figmaSwatchImage(color, selected: selected) : Self.swatchImage(color, size: NSSize(width: 20, height: 16), selected: selected)
             button.setAccessibilityLabel("预设颜色 \(color.hex)\(selected ? "，已选中" : "")")
             button.setAccessibilityValue(selected ? "已选中" : "未选中")
         }
@@ -1157,6 +1334,13 @@ final class SelectionView: NSView {
         return min(max(range.min, raw), max(range.min, range.max))
     }
     private static let presetColors: [NSColor] = ["#FF3B30", "#FF9500", "#FFCC00", "#34C759", "#5AC8FA", "#007AFF", "#AF52DE", "#FF2D55", "#A2845E", "#8E8E93", "#FFFFFF", "#000000"].compactMap { NSColor(hex: $0) }
+    private static let figmaColors: [NSColor] = ["#FA5151", "#000000", "#FFFFFF", "#10AEFF", "#34A853", "#FFC300"].compactMap { NSColor(hex: $0) }
+    private static func figmaSwatchImage(_ color: NSColor, selected: Bool) -> NSImage {
+        let image = NSImage(size: NSSize(width: 22, height: 22)); image.lockFocus()
+        color.setFill(); NSBezierPath(ovalIn: NSRect(x: 3, y: 3, width: 16, height: 16)).fill()
+        if selected { AnnotationView.focusedStroke(for: color).setStroke(); let ring = NSBezierPath(ovalIn: NSRect(x: 1, y: 1, width: 20, height: 20)); ring.lineWidth = 2; ring.stroke() }
+        image.unlockFocus(); return image
+    }
     private static func swatchImage(_ color: NSColor, size: NSSize, selected: Bool = false) -> NSImage {
         let image = NSImage(size: size)
         image.lockFocus()
@@ -1176,8 +1360,6 @@ final class SelectionView: NSView {
         image.unlockFocus()
         return image
     }
-    private static func timestamp() -> String { let formatter = DateFormatter(); formatter.dateFormat = "yyyy-MM-dd-HHmmss"; return formatter.string(from: Date()) }
-
     private func remember() {
         guard let editor else { return }
         undoStack.append(RegionEditSnapshot(selection: selection, editor: editor.stateSnapshot)); if undoStack.count > 20 { undoStack.removeFirst() }; redoStack.removeAll()
@@ -1200,7 +1382,6 @@ final class SelectionView: NSView {
         let tiny = CaptureFocusChain.isTiny(selection)
         toolbar.isHidden = tiny
         if tiny {
-            if optionsPanel?.isVisible == true { hideOptionsPanel() }
             updateFocusChain()
             return
         }
@@ -1211,17 +1392,42 @@ final class SelectionView: NSView {
         updateFocusChain()
     }
 
-    private func positionOptionsPanel() {
-        guard let optionsPanel, let toolbar else { return }
+    private func positionOptionsPanel(animated: Bool = false) {
+        guard let optionsPanel, let toolbar, toolButtons.indices.contains(lastToolIndex) else { return }
         let visible = targetScreen.visibleFrame
+        let anchor = toolButtons[lastToolIndex]
+        let anchorScreen = window.map { $0.convertToScreen(anchor.convert(anchor.bounds, to: nil)) } ?? anchor.frame
         let toolbarScreen = window.map { $0.convertToScreen(toolbar.convert(toolbar.bounds, to: nil)) } ?? toolbar.frame
-        optionsPanel.setFrame(CaptureOverlayLayout.optionsPanelFrame(contentHeight: optionsContentHeight, visibleFrame: visible, toolbarFrame: toolbarScreen), display: false)
+        let size = optionsPanel.frame.size
+        let bounds = visible.insetBy(dx: CaptureOverlayLayout.edgeInset, dy: CaptureOverlayLayout.edgeInset)
+        let x = min(max(bounds.minX, anchorScreen.midX - size.width / 2), bounds.maxX - size.width)
+        let gap: CGFloat = 8
+        let below = toolbarScreen.minY - size.height - gap
+        let y = below >= bounds.minY ? below : min(bounds.maxY - size.height, toolbarScreen.maxY + gap)
+        let origin = CGPoint(x: x, y: y)
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.2
+                updateOptionsTail(anchorX: anchorScreen.midX - x, width: size.width, animated: true)
+            }
+            optionsPanel.setFrame(NSRect(origin: origin, size: size), display: true, animate: true)
+        } else {
+            optionsPanel.setFrameOrigin(origin)
+            updateOptionsTail(anchorX: anchorScreen.midX - x, width: size.width)
+        }
+        optionsPanel.orderFrontRegardless()
+    }
+
+    private func updateOptionsTail(anchorX: CGFloat, width: CGFloat, animated: Bool = false) {
+        let x = min(max(10, anchorX), width - 10)
+        let frame = NSRect(x: x - 8, y: 59, width: 16, height: 9.59167)
+        if animated { optionsTailView?.animator().frame = frame } else { optionsTailView?.frame = frame }
     }
 
     private func handle(at point: CGPoint) -> SelectionHandle? {
         let radius: CGFloat = 10
         let handles: [(SelectionHandle, CGPoint)] = [(.southWest, CGPoint(x: selection.minX, y: selection.minY)), (.south, CGPoint(x: selection.midX, y: selection.minY)), (.southEast, CGPoint(x: selection.maxX, y: selection.minY)), (.west, CGPoint(x: selection.minX, y: selection.midY)), (.east, CGPoint(x: selection.maxX, y: selection.midY)), (.northWest, CGPoint(x: selection.minX, y: selection.maxY)), (.north, CGPoint(x: selection.midX, y: selection.maxY)), (.northEast, CGPoint(x: selection.maxX, y: selection.maxY))]
-        return handles.first { hypot($0.1.x - point.x, $0.1.y - point.y) <= radius }?.0 ?? (selection.contains(point) && (editor?.tool == .select || (mode == .regionRecording && phase == .editing)) ? .move : nil)
+        return handles.first { hypot($0.1.x - point.x, $0.1.y - point.y) <= radius }?.0 ?? (selection.contains(point) && (editor == nil || mode == .regionRecording) ? .move : nil)
     }
     private func resizeSelection(handle: SelectionHandle, to point: CGPoint) {
         let dx = point.x - dragOrigin.x, dy = point.y - dragOrigin.y
@@ -1234,8 +1440,15 @@ final class SelectionView: NSView {
         selection = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY).integral.intersection(bounds)
     }
     private func drawHandles(around rect: CGRect) {
-        NSColor.white.setFill()
-        for point in [CGPoint(x: rect.minX, y: rect.minY), CGPoint(x: rect.midX, y: rect.minY), CGPoint(x: rect.maxX, y: rect.minY), CGPoint(x: rect.minX, y: rect.midY), CGPoint(x: rect.maxX, y: rect.midY), CGPoint(x: rect.minX, y: rect.maxY), CGPoint(x: rect.midX, y: rect.maxY), CGPoint(x: rect.maxX, y: rect.maxY)] { NSBezierPath(ovalIn: CGRect(x: point.x - 4, y: point.y - 4, width: 8, height: 8)).fill() }
+        drawSelectionAccents(around: rect, color: NSColor(hex: "#10AEFF")!)
+    }
+
+    private func drawSelectionAccents(around rect: CGRect, color: NSColor) {
+        color.setStroke()
+        for (x, y, sx, sy) in [(rect.minX, rect.minY, 1.0, 1.0), (rect.maxX, rect.minY, -1.0, 1.0), (rect.minX, rect.maxY, 1.0, -1.0), (rect.maxX, rect.maxY, -1.0, -1.0)] {
+            let p = NSBezierPath(); p.move(to: CGPoint(x: x + 26 * sx, y: y)); p.line(to: CGPoint(x: x + 8 * sx, y: y)); p.curve(to: CGPoint(x: x, y: y + 8 * sy), controlPoint1: CGPoint(x: x + 3 * sx, y: y), controlPoint2: CGPoint(x: x, y: y + 3 * sy)); p.line(to: CGPoint(x: x, y: y + 26 * sy)); p.lineWidth = 3; p.lineCapStyle = .round; p.stroke()
+        }
+        for (a, b) in [(CGPoint(x: rect.midX - 11, y: rect.minY), CGPoint(x: rect.midX + 11, y: rect.minY)), (CGPoint(x: rect.midX - 11, y: rect.maxY), CGPoint(x: rect.midX + 11, y: rect.maxY)), (CGPoint(x: rect.minX, y: rect.midY - 11), CGPoint(x: rect.minX, y: rect.midY + 11)), (CGPoint(x: rect.maxX, y: rect.midY - 11), CGPoint(x: rect.maxX, y: rect.midY + 11))] { let p = NSBezierPath(); p.move(to: a); p.line(to: b); p.lineWidth = 3; p.lineCapStyle = .round; p.stroke() }
     }
 }
 
@@ -1292,10 +1505,6 @@ extension SelectionView: NSSharingServicePickerDelegate {
     }
 }
 
-private final class OptionsPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
-}
-
 final class BrushSlider: NSSlider {
     var onBegin: (() -> Void)?
     var onCommit: (() -> Void)?
@@ -1310,5 +1519,39 @@ final class BrushSlider: NSSlider {
             return
         }
         super.keyDown(with: event)
+    }
+}
+
+final class SizeDotControl: NSControl {
+    var minValue = 1.0
+    var maxValue = 8.0
+    override var doubleValue: Double { didSet { needsDisplay = true; setAccessibilityValue(String(Int(doubleValue))) } }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        NSColor(hex: "#D9D9D9")!.setStroke()
+        let ring = NSBezierPath(ovalIn: CGRect(x: center.x - 14.43, y: center.y - 14.43, width: 28.86, height: 28.86)); ring.lineWidth = 1.14; ring.stroke()
+        let progress = maxValue > minValue ? (doubleValue - minValue) / (maxValue - minValue) : 0
+        let radius = CGFloat(3 + progress * 8)
+        NSColor(hex: "#D9D9D9")!.setFill(); NSBezierPath(ovalIn: CGRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)).fill()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let origin = event.locationInWindow.x, initial = doubleValue
+        var next = event
+        repeat {
+            if next.type == .leftMouseDragged || next.type == .leftMouseDown {
+                doubleValue = min(maxValue, max(minValue, initial + Double(next.locationInWindow.x - origin) / 32 * (maxValue - minValue)))
+                sendAction(action, to: target)
+            }
+            guard next.type != .leftMouseUp, let event = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else { break }
+            next = event
+        } while true
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard event.keyCode == 123 || event.keyCode == 124 else { super.keyDown(with: event); return }
+        doubleValue = min(maxValue, max(minValue, doubleValue + (event.keyCode == 124 ? 1 : -1))); sendAction(action, to: target)
     }
 }

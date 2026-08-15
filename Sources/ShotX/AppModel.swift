@@ -4,6 +4,7 @@ import Carbon.HIToolbox
 import CoreGraphics
 import Foundation
 import ScreenCaptureKit
+import ServiceManagement
 
 enum CaptureMode: String, CaseIterable, Identifiable {
     case region = "区域截图"
@@ -14,6 +15,8 @@ enum CaptureMode: String, CaseIterable, Identifiable {
     case displayRecording = "显示器录屏"
 
     var id: String { rawValue }
+    var displayName: String { self == .region ? "截图" : rawValue }
+    static let activeShortcutCases: [CaptureMode] = [.region, .regionRecording, .displayRecording]
     var isRegion: Bool { self == .region || self == .scrolling || self == .regionRecording }
     var isDisplay: Bool { self == .display || self == .displayRecording }
     var isFoundationOnly: Bool { self == .scrolling || self == .regionRecording || self == .displayRecording }
@@ -23,7 +26,8 @@ struct Shortcut: Codable, Equatable {
     var keyCode: UInt32
     var modifiers: UInt32
 
-    static let defaults: [CaptureMode: Shortcut] = [
+    static let none = Shortcut(keyCode: .max, modifiers: 0)
+    static let legacyDefaults: [CaptureMode: Shortcut] = [
         .region: .init(keyCode: UInt32(kVK_ANSI_4), modifiers: UInt32(cmdKey | shiftKey)),
         .window: .init(keyCode: UInt32(kVK_ANSI_4), modifiers: UInt32(cmdKey | shiftKey | optionKey)),
         .display: .init(keyCode: UInt32(kVK_ANSI_3), modifiers: UInt32(cmdKey | shiftKey)),
@@ -31,14 +35,25 @@ struct Shortcut: Codable, Equatable {
         .regionRecording: .init(keyCode: UInt32(kVK_ANSI_R), modifiers: UInt32(optionKey | shiftKey)),
         .displayRecording: .init(keyCode: UInt32(kVK_ANSI_R), modifiers: UInt32(optionKey | shiftKey | controlKey))
     ]
+    static let defaults = Dictionary(uniqueKeysWithValues: CaptureMode.allCases.map { ($0, Shortcut.none) })
+    var isEmpty: Bool { modifiers == 0 }
 
     var label: String {
         let flags: [(UInt32, String)] = [(UInt32(controlKey), "⌃"), (UInt32(optionKey), "⌥"), (UInt32(shiftKey), "⇧"), (UInt32(cmdKey), "⌘")]
+        guard !isEmpty else { return "未设置" }
         let names: [UInt32: String] = [
             UInt32(kVK_ANSI_0): "0", UInt32(kVK_ANSI_1): "1", UInt32(kVK_ANSI_2): "2",
             UInt32(kVK_ANSI_3): "3", UInt32(kVK_ANSI_4): "4", UInt32(kVK_ANSI_5): "5",
             UInt32(kVK_ANSI_6): "6", UInt32(kVK_ANSI_7): "7", UInt32(kVK_ANSI_8): "8",
-            UInt32(kVK_ANSI_9): "9", UInt32(kVK_ANSI_R): "R"
+            UInt32(kVK_ANSI_9): "9", UInt32(kVK_ANSI_A): "A", UInt32(kVK_ANSI_B): "B",
+            UInt32(kVK_ANSI_C): "C", UInt32(kVK_ANSI_D): "D", UInt32(kVK_ANSI_E): "E",
+            UInt32(kVK_ANSI_F): "F", UInt32(kVK_ANSI_G): "G", UInt32(kVK_ANSI_H): "H",
+            UInt32(kVK_ANSI_I): "I", UInt32(kVK_ANSI_J): "J", UInt32(kVK_ANSI_K): "K",
+            UInt32(kVK_ANSI_L): "L", UInt32(kVK_ANSI_M): "M", UInt32(kVK_ANSI_N): "N",
+            UInt32(kVK_ANSI_O): "O", UInt32(kVK_ANSI_P): "P", UInt32(kVK_ANSI_Q): "Q",
+            UInt32(kVK_ANSI_R): "R", UInt32(kVK_ANSI_S): "S", UInt32(kVK_ANSI_T): "T",
+            UInt32(kVK_ANSI_U): "U", UInt32(kVK_ANSI_V): "V", UInt32(kVK_ANSI_W): "W",
+            UInt32(kVK_ANSI_X): "X", UInt32(kVK_ANSI_Y): "Y", UInt32(kVK_ANSI_Z): "Z"
         ]
         return flags.filter { modifiers & $0.0 != 0 }.map(\.1).joined() + (names[keyCode] ?? "?")
     }
@@ -64,6 +79,8 @@ struct AppSettings: Codable, Equatable {
     var windowShadow = true
     var systemAudio = true
     var microphone = false
+    // Optional keeps settings written by older ShotX builds decodable.
+    private var camera: Bool? = false
     var selectedMicrophoneID = ""
     var showsCursor = true
     var showsClicks = true
@@ -71,23 +88,27 @@ struct AppSettings: Codable, Equatable {
     var annotationColors = Dictionary(uniqueKeysWithValues: AnnotationTool.styledCases.map { ($0.rawValue, "#FF3B30") })
     var annotationSizes = Dictionary(uniqueKeysWithValues: AnnotationTool.styledCases.map { ($0.rawValue, AnnotationTool.defaultSize(for: $0)) })
     var lastSaveDirectory: String?
-    var shortcuts = Dictionary(uniqueKeysWithValues: CaptureMode.allCases.map { ($0.rawValue, Shortcut.defaults[$0]!) })
+    var shortcuts = Dictionary(uniqueKeysWithValues: CaptureMode.allCases.map { ($0.rawValue, Shortcut.none) })
 
     static let defaults = AppSettings()
-    func shortcut(for mode: CaptureMode) -> Shortcut { shortcuts[mode.rawValue] ?? Shortcut.defaults[mode]! }
+    var cameraEnabled: Bool {
+        get { camera ?? false }
+        set { camera = newValue }
+    }
+    func shortcut(for mode: CaptureMode) -> Shortcut { shortcuts[mode.rawValue] ?? .none }
 }
 
 enum AnnotationTool: String, CaseIterable, Identifiable {
-    case select = "选择", arrow = "箭头", rectangle = "矩形", pen = "画笔", text = "文字", mosaic = "马赛克", crop = "裁剪"
+    case move = "移动", rectangle = "矩形", ellipse = "椭圆", line = "直线", arrow = "箭头", pen = "画笔", mosaic = "马赛克", text = "文字", crop = "标注"
     var id: String { rawValue }
-    static let styledCases: [AnnotationTool] = [.arrow, .rectangle, .pen, .text, .mosaic]
+    static let styledCases: [AnnotationTool] = [.rectangle, .ellipse, .line, .arrow, .pen, .mosaic, .text]
 
     /// Continuous draggable brush range and discrete preset values for the tool options popover (FR-CAP-15/16).
     var styleRange: (min: Double, max: Double, presets: [Double], unit: String) {
         switch self {
-        case .text: (11, 32, [11, 13, 16, 24, 32], "pt")
+        case .text: (6, 96, [6, 10, 16, 32, 64, 96], "pt")
         case .mosaic: (8, 40, [8, 16, 24, 40], "px")
-        case .select, .crop: (0, 0, [], "")
+        case .move, .crop: (0, 0, [], "")
         default: (1, 8, [1, 2, 4, 8], "pt")
         }
     }
@@ -102,7 +123,14 @@ enum AnnotationTool: String, CaseIterable, Identifiable {
 
     var styleAccessibilityLabel: String { "\(styleLabel)（\(styleRange.unit)）" }
     func styleAccessibilityValue(_ value: Double) -> String { "\(Int(value)) \(styleRange.unit)" }
-    static func defaultSize(for tool: AnnotationTool) -> Double { tool == .text || tool == .mosaic ? 16 : 2 }
+    static func defaultSize(for tool: AnnotationTool) -> Double {
+        let presets = tool.styleRange.presets
+        return presets.isEmpty ? 0 : presets[presets.count / 2]
+    }
+}
+
+enum AnnotationTextStyle: Int, CaseIterable {
+    case normal, outlined, inverseOutlined, highlight
 }
 
 enum RecentResult {
@@ -114,12 +142,14 @@ enum PermissionKind: String, CaseIterable, Identifiable {
     case screen = "屏幕录制"
     case systemAudio = "系统音频"
     case microphone = "麦克风"
+    case camera = "摄像头"
     var id: String { rawValue }
     var purpose: String {
         switch self {
         case .screen: "截取或录制屏幕；内容只在这台 Mac 上处理。"
         case .systemAudio: "仅在录屏时写入电脑声音。"
         case .microphone: "仅在你启用麦克风录制时申请。"
+        case .camera: "仅在你启用摄像头画面录制时申请。"
         }
     }
 }
@@ -138,6 +168,7 @@ final class AppModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var recentResult: RecentResult?
     @Published private(set) var recording = false
+    @Published private(set) var launchAtLogin = [SMAppService.Status.enabled, .requiresApproval].contains(SMAppService.mainApp.status)
 
     private let defaults: UserDefaults
     private let settingsKey = "settings.v1"
@@ -146,7 +177,10 @@ final class AppModel: ObservableObject {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        settings = defaults.data(forKey: settingsKey).flatMap { try? JSONDecoder().decode(AppSettings.self, from: $0) } ?? .defaults
+        var loaded = defaults.data(forKey: settingsKey).flatMap { try? JSONDecoder().decode(AppSettings.self, from: $0) } ?? .defaults
+        for mode in CaptureMode.allCases where loaded.shortcuts[mode.rawValue] == Shortcut.legacyDefaults[mode] { loaded.shortcuts[mode.rawValue] = Shortcut.none }
+        for mode in CaptureMode.allCases where !CaptureMode.activeShortcutCases.contains(mode) { loaded.shortcuts[mode.rawValue] = Shortcut.none }
+        settings = loaded
     }
 
     func start() {
@@ -185,10 +219,10 @@ final class AppModel: ObservableObject {
     func shortcut(for mode: CaptureMode) -> Shortcut { settings.shortcut(for: mode) }
 
     func updateShortcut(_ shortcut: Shortcut, for mode: CaptureMode) -> Result<Void, ShortcutValidation> {
-        if let duplicate = CaptureMode.allCases.first(where: { $0 != mode && settings.shortcut(for: $0) == shortcut }) {
+        if !shortcut.isEmpty, let duplicate = CaptureMode.activeShortcutCases.first(where: { $0 != mode && settings.shortcut(for: $0) == shortcut }) {
             return .failure(.duplicate(duplicate))
         }
-        if HotKeyManager.isReserved(shortcut) { return .failure(.reserved) }
+        if !shortcut.isEmpty, HotKeyManager.isReserved(shortcut) { return .failure(.reserved) }
         let old = settings.shortcut(for: mode)
         var candidate = settings.shortcuts
         candidate[mode.rawValue] = shortcut
@@ -201,6 +235,18 @@ final class AppModel: ObservableObject {
             try? hotKeys.register(settings.shortcuts.compactMap { entry in CaptureMode(rawValue: entry.key).map { currentMode in (currentMode, entry.value) } })
             settings.shortcuts[mode.rawValue] = old
             return .failure(.registrationFailed)
+        }
+    }
+
+    func clearShortcut(for mode: CaptureMode) { _ = updateShortcut(.none, for: mode) }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        Task {
+            do {
+                if enabled { try SMAppService.mainApp.register() }
+                else { try await SMAppService.mainApp.unregister() }
+            } catch { errorMessage = enabled ? "无法启用开机启动：\(error.localizedDescription)" : "无法关闭开机启动：\(error.localizedDescription)" }
+            launchAtLogin = [SMAppService.Status.enabled, .requiresApproval].contains(SMAppService.mainApp.status)
         }
     }
 
@@ -240,11 +286,13 @@ final class AppModel: ObservableObject {
         permissions[.screen] = .checking
         permissions[.systemAudio] = .checking
         permissions[.microphone] = .checking
+        permissions[.camera] = .checking
 
         let screenAllowed = CGPreflightScreenCaptureAccess()
         permissions[.screen] = screenAllowed ? .allowed : .unavailable
         permissions[.systemAudio] = screenAllowed ? .allowed : .notDetermined
         permissions[.microphone] = Self.state(for: AVCaptureDevice.authorizationStatus(for: .audio))
+        permissions[.camera] = Self.state(for: AVCaptureDevice.authorizationStatus(for: .video))
         NSLog("SHOTX-DEBUG permissions mic=\(permissions[.microphone]?.rawValue ?? "?") screen=\(permissions[.screen]?.rawValue ?? "?")")
     }
 
@@ -267,11 +315,17 @@ final class AppModel: ObservableObject {
         case .systemAudio: openPrivacySettings(.screen)
         case .microphone:
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] _ in Task { await self?.refreshPermissions() } }
+        case .camera:
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] _ in Task { await self?.refreshPermissions() } }
         }
     }
 
     func openPrivacySettings(_ kind: PermissionKind) {
-        let pane = kind == .microphone ? "Privacy_Microphone" : "Privacy_ScreenCapture"
+        let pane = switch kind {
+        case .microphone: "Privacy_Microphone"
+        case .camera: "Privacy_Camera"
+        case .screen, .systemAudio: "Privacy_ScreenCapture"
+        }
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") { NSWorkspace.shared.open(url) }
     }
 
@@ -303,6 +357,15 @@ final class AppModel: ObservableObject {
     func showError(_ message: String) { errorMessage = message }
 }
 
+enum ShotXOutputName {
+    static func make(extension pathExtension: String, date: Date = .now) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "MM-dd-HH:mm:ss"
+        return "ShotX_\(formatter.string(from: date)).\(pathExtension)"
+    }
+}
+
 final class HotKeyManager {
     var onTrigger: ((CaptureMode) -> Void)?
     private var refs: [EventHotKeyRef] = []
@@ -327,7 +390,7 @@ final class HotKeyManager {
         refs = []
         old.forEach { _ = UnregisterEventHotKey($0) }
         do {
-            for (mode, shortcut) in shortcuts {
+            for (mode, shortcut) in shortcuts where !shortcut.isEmpty {
                 var ref: EventHotKeyRef?
                 let id = EventHotKeyID(signature: OSType(0x53485458), id: UInt32(CaptureMode.allCases.firstIndex(of: mode)!))
                 guard RegisterEventHotKey(shortcut.keyCode, shortcut.carbonModifiers, id, GetApplicationEventTarget(), 0, &ref) == noErr, let ref else { throw ShortcutValidation.registrationFailed }

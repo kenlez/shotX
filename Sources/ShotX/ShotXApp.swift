@@ -40,11 +40,12 @@ private struct CaptureMenu: View {
 
     var body: some View {
         Group {
-        ForEach(Array(CaptureMode.allCases.enumerated()), id: \.element) { index, mode in
-            if index == 4 { Divider() }
-            Button { model.begin(mode) } label: {
-                HStack { Text(mode.rawValue); Spacer(); Text(model.shortcut(for: mode).label) }
-            }
+        Button { model.begin(.region) } label: {
+            HStack { Text(CaptureMode.region.displayName); Spacer(); Text(model.shortcut(for: .region).label) }
+        }
+        Divider()
+        ForEach([CaptureMode.regionRecording, .displayRecording]) { mode in
+            Button { model.begin(mode) } label: { HStack { Text(mode.rawValue); Spacer(); Text(model.shortcut(for: mode).label) } }
         }
         Divider()
         if model.recording {
@@ -80,13 +81,13 @@ private struct CaptureMenu: View {
         switch model.recentResult {
         case .image(let image):
             guard let data = image.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:))?.representation(using: .png, properties: [:]) else { return }
-            let panel = NSSavePanel(); panel.allowedContentTypes = [.png]; panel.nameFieldStringValue = "ShotX.png"
+            let panel = NSSavePanel(); panel.allowedContentTypes = [.png]; panel.nameFieldStringValue = ShotXOutputName.make(extension: "png")
             if panel.runModal() == .OK, let url = panel.url {
                 do { try data.write(to: url, options: .atomic) }
                 catch { model.showError("保存失败。最近结果仍保留，请重试或另存为。") }
             }
         case .video(let source, _):
-            let panel = NSSavePanel(); panel.allowedContentTypes = [.mpeg4Movie]; panel.nameFieldStringValue = "ShotX.mp4"
+            let panel = NSSavePanel(); panel.allowedContentTypes = [.mpeg4Movie]; panel.nameFieldStringValue = ShotXOutputName.make(extension: "mp4")
             if panel.runModal() == .OK, let url = panel.url {
                 do { try FileManager.default.copyItem(at: source, to: url); model.recentResult = .video(url, saved: true) }
                 catch { model.showError("保存失败。恢复文件仍保留，请重试或另存为。") }
@@ -98,10 +99,5 @@ private struct CaptureMenu: View {
 
 @MainActor
 private enum PinRecent {
-    private static var windows: [NSWindow] = []
-    static func show(_ image: NSImage) {
-        let size = NSSize(width: min(600, image.size.width), height: min(450, image.size.height))
-        let window = NSPanel(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless, .resizable, .nonactivatingPanel], backing: .buffered, defer: false)
-        window.level = .floating; window.isMovableByWindowBackground = true; window.hasShadow = true; window.contentView = NSImageView(image: image); window.center(); window.orderFront(nil); windows.append(window)
-    }
+    static func show(_ image: NSImage) { PinWindowController.show(image) }
 }

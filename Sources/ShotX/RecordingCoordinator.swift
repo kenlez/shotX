@@ -43,7 +43,9 @@ enum RecordingOverlayState: Equatable {
     case countdown(Int)
     case recording
 
-    var maskAlpha: CGFloat { self == .setup ? 0.28 : 1 }
+    var maskAlpha: CGFloat {
+        switch self { case .setup, .countdown: 0.28; case .recording: 0.45 }
+    }
     var label: String {
         switch self {
         case .setup, .countdown: "录制区域"
@@ -67,6 +69,17 @@ enum RecordingOutputSize {
     }
 }
 
+enum CameraOverlayLayout {
+    static func rect(in bounds: CGRect) -> CGRect {
+        let margin = min(12, bounds.width / 10, bounds.height / 10)
+        let availableWidth = max(1, bounds.width - margin * 2)
+        let availableHeight = max(1, bounds.height - margin * 2)
+        let width = min(240, availableWidth, availableHeight * 4 / 3, max(80, bounds.width * 0.28))
+        let height = width * 3 / 4
+        return CGRect(x: bounds.maxX - margin - width, y: bounds.minY + margin, width: width, height: height)
+    }
+}
+
 enum RecoveryStore {
     static func directory(fileManager: FileManager = .default) throws -> URL {
         let support = try fileManager.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
@@ -76,7 +89,7 @@ enum RecoveryStore {
     }
 
     static func newURL() throws -> URL {
-        try directory().appendingPathComponent("ShotX-Recovery-\(Int(Date().timeIntervalSince1970)).mp4")
+        try directory().appendingPathComponent(ShotXOutputName.make(extension: "mp4"))
     }
 
     static func recoverableVideos(fileManager: FileManager = .default) -> [URL] {
@@ -95,6 +108,7 @@ final class RecordingCoordinator: NSObject {
     private var status: RecordingStatusWindowController?
     private var setup: RecordingSetupWindowController?
     private var overlay: RecordingRegionOverlayController?
+    private var cameraPreview: CameraPreviewWindowController?
     private var geometry: RecordingSetupGeometry?
     private weak var selection: SelectionWindowController?
     private var countdownTask: Task<Void, Never>?
@@ -166,9 +180,13 @@ final class RecordingCoordinator: NSObject {
             settings.microphone = false
             model.showError("麦克风不可用。你仍可继续无麦克风录制。")
         }
+        if settings.cameraEnabled && model.permissions[.camera] != .allowed {
+            settings.cameraEnabled = false
+            model.showError("摄像头不可用。你仍可继续无摄像头录制。")
+        }
         let delay = settings.countdown
-        let sources = [settings.systemAudio ? "系统声" : nil, settings.microphone ? "麦克风" : nil].compactMap { $0 }.joined(separator: "+")
-        status = RecordingStatusWindowController(sources: sources.isEmpty ? "静音" : sources, onStop: { [weak self] in self?.cancelCountdown() })
+        let sources = [settings.systemAudio ? "系统声" : nil, settings.microphone ? "麦克风" : nil, settings.cameraEnabled ? "摄像头" : nil].compactMap { $0 }.joined(separator: "+")
+        status = RecordingStatusWindowController(screen: pending.screen, selection: locked, sources: sources.isEmpty ? "静音" : sources, onStop: { [weak self] in self?.cancelCountdown() })
         overlay?.show(state: .countdown(delay))
         status?.showCountdown(delay)
         installEscapeMonitor { [weak self] in self?.cancelCountdown() }
@@ -210,6 +228,10 @@ final class RecordingCoordinator: NSObject {
                 Task { @MainActor in self?.finished(result) }
             }
             self.recorder = recorder
+            if let cameraSession = recorder.cameraSession {
+                cameraPreview = CameraPreviewWindowController(session: cameraSession, screen: screen, selection: localRect)
+                cameraPreview?.show()
+            }
             model?.setRecording(true)
             CaptureCoordinator.shared.cancel()
             selection = nil
@@ -232,6 +254,8 @@ final class RecordingCoordinator: NSObject {
         status = nil
         overlay?.close()
         overlay = nil
+        cameraPreview?.close()
+        cameraPreview = nil
         selection = nil
         pending = nil
         switch result {
@@ -248,6 +272,8 @@ final class RecordingCoordinator: NSObject {
         status = nil
         overlay?.close()
         overlay = nil
+        cameraPreview?.close()
+        cameraPreview = nil
         guard recorder == nil, let pending, let model else { return }
         if let selection {
             selection.showForSetup()
@@ -287,8 +313,8 @@ final class RecordingCoordinator: NSObject {
     private func installMenuTrackingObserver() {
         guard menuTrackingObservers.isEmpty else { return }
         let center = NotificationCenter.default
-        menuTrackingObservers.append(center.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] _ in self?.menuTracking = true })
-        menuTrackingObservers.append(center.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main) { [weak self] _ in self?.menuTracking = false })
+        menuTrackingObservers.append(center.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main) { [weak self] _ in Task { @MainActor in self?.menuTracking = true } })
+        menuTrackingObservers.append(center.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main) { [weak self] _ in Task { @MainActor in self?.menuTracking = false } })
     }
 
     private func installEscapeMonitor(_ handler: @escaping () -> Void) {
@@ -329,6 +355,8 @@ final class RecordingCoordinator: NSObject {
         status = nil
         overlay?.close()
         overlay = nil
+        cameraPreview?.close()
+        cameraPreview = nil
         geometry = nil
         selection = nil
         pending = nil
@@ -363,9 +391,13 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
     private var clickMonitor: Any?
     private var sourceSession: AVCaptureSession?
     private var microphoneOutput: AVCaptureAudioDataOutput?
+    private var cameraOutput: AVCaptureVideoDataOutput?
+    private var latestCameraFrame: CIImage?
     private var disconnectObserver: NSObjectProtocol?
     private let onNotice: (String) -> Void
     private var warnedDisk = false
+
+    var cameraSession: AVCaptureSession? { cameraOutput == nil ? nil : sourceSession }
 
     init(url: URL, filter: SCContentFilter, screenFrame: CGRect, sourceRect: CGRect, width: Int, height: Int, settings: AppSettings, onNotice: @escaping (String) -> Void, completion: @escaping (Result<URL, Error>) -> Void) throws {
         self.url = url
@@ -416,7 +448,7 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
         super.init()
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         if settings.systemAudio { try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue) }
-        if settings.microphone { sourceSession = try makeSourceSession(settings: settings) }
+        if settings.microphone || settings.cameraEnabled { sourceSession = try makeSourceSession(settings: settings) }
         disconnectObserver = NotificationCenter.default.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: nil, queue: nil) { [weak self] notification in
             guard let self, let device = notification.object as? AVCaptureDevice else { return }
             self.queue.async {
@@ -471,6 +503,7 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
         guard let source = sample.imageBuffer, let pool = videoAdaptor.pixelBufferPool else { return }
         var target: CVPixelBuffer?; guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &target) == kCVReturnSuccess, let target else { return }
         var image = CIImage(cvPixelBuffer: source)
+        if let camera = latestCameraFrame { image = composite(camera: camera, over: image) }
         if let (point, date) = lastClick, Date().timeIntervalSince(date) < 0.3, let ring = clickRing(at: point) { image = ring.composited(over: image) }
         ciContext.render(image, to: target, bounds: CGRect(x: 0, y: 0, width: width, height: height), colorSpace: CGColorSpaceCreateDeviceRGB())
         videoAdaptor.append(target, withPresentationTime: sample.presentationTimeStamp)
@@ -481,10 +514,32 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
         if settings.microphone, let device = Self.device(mediaType: .audio, id: settings.selectedMicrophoneID) {
             try session.addInput(AVCaptureDeviceInput(device: device)); let output = AVCaptureAudioDataOutput(); output.setSampleBufferDelegate(self, queue: queue); session.addOutput(output); microphoneOutput = output
         }
+        if settings.cameraEnabled, let device = AVCaptureDevice.default(for: .video) {
+            try session.addInput(AVCaptureDeviceInput(device: device))
+            let output = AVCaptureVideoDataOutput()
+            output.alwaysDiscardsLateVideoFrames = true
+            output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            output.setSampleBufferDelegate(self, queue: queue)
+            session.addOutput(output)
+            cameraOutput = output
+        }
         session.commitConfiguration(); return session
     }
 
     private static func device(mediaType: AVMediaType, id: String) -> AVCaptureDevice? { id.isEmpty ? AVCaptureDevice.default(for: mediaType) : AVCaptureDevice(uniqueID: id) }
+
+    private func composite(camera: CIImage, over screen: CIImage) -> CIImage {
+        let rect = CameraOverlayLayout.rect(in: CGRect(x: 0, y: 0, width: width, height: height))
+        let normalized = camera.transformed(by: CGAffineTransform(translationX: -camera.extent.minX, y: -camera.extent.minY))
+        let mirrored = normalized.transformed(by: CGAffineTransform(translationX: normalized.extent.width, y: 0).scaledBy(x: -1, y: 1))
+        let scale = max(rect.width / mirrored.extent.width, rect.height / mirrored.extent.height)
+        let scaled = mirrored.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let positioned = scaled.transformed(by: CGAffineTransform(translationX: rect.midX - scaled.extent.midX, y: rect.midY - scaled.extent.midY)).cropped(to: rect)
+        guard let mask = CIFilter(name: "CIRoundedRectangleGenerator", parameters: ["inputExtent": CIVector(cgRect: rect), "inputRadius": 12, "inputColor": CIColor.white])?.outputImage else { return positioned.composited(over: screen) }
+        let clear = CIImage(color: .clear).cropped(to: rect)
+        let rounded = positioned.applyingFilter("CIBlendWithMask", parameters: [kCIInputBackgroundImageKey: clear, kCIInputMaskImageKey: mask])
+        return rounded.composited(over: screen)
+    }
 
     private func clickRing(at global: CGPoint) -> CIImage? {
         guard let point = CaptureGeometry(screenFrame: screenFrame, sourceRect: sourceRect, outputSize: CGSize(width: width, height: height)).outputPoint(for: global) else { return nil }
@@ -503,10 +558,38 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
     }
 }
 
-extension ScreenRecorder: AVCaptureAudioDataOutputSampleBufferDelegate {
+extension ScreenRecorder: AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         if output === microphoneOutput, started, let microphone, microphone.isReadyForMoreMediaData { microphone.append(sampleBuffer) }
+        else if output === cameraOutput, let pixel = sampleBuffer.imageBuffer { latestCameraFrame = CIImage(cvPixelBuffer: pixel) }
     }
+}
+
+@MainActor
+private final class CameraPreviewWindowController {
+    private let window: NSPanel
+
+    init(session: AVCaptureSession, screen: NSScreen, selection: CGRect) {
+        let local = CameraOverlayLayout.rect(in: CGRect(origin: .zero, size: selection.size))
+        let frame = local.offsetBy(dx: screen.frame.minX + selection.minX, dy: screen.frame.minY + selection.minY)
+        window = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        window.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 2)
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.hasShadow = true
+        window.ignoresMouseEvents = true
+        window.isMovable = false
+        window.isMovableByWindowBackground = false
+        window.sharingType = .none
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let view = NSView(frame: CGRect(origin: .zero, size: frame.size)); view.wantsLayer = true
+        let preview = AVCaptureVideoPreviewLayer(session: session); preview.frame = view.bounds; preview.videoGravity = .resizeAspectFill; preview.cornerRadius = 12; preview.masksToBounds = true
+        view.layer?.addSublayer(preview)
+        window.contentView = view
+    }
+
+    func show() { window.orderFrontRegardless() }
+    func close() { window.close() }
 }
 
 @MainActor
@@ -517,13 +600,17 @@ private final class RecordingSetupWindowController: NSWindowController {
     init(model: AppModel, screen: NSScreen, geometry: RecordingSetupGeometry, onStart: @escaping () -> Void, onReturn: @escaping () -> Void) {
         self.screen = screen
         self.geometry = geometry
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 320), styleMask: [.titled, .fullSizeContentView], backing: .buffered, defer: false)
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 256, height: 140), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
-        panel.isMovableByWindowBackground = true
+        panel.isMovable = false
+        panel.isMovableByWindowBackground = false
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.contentView = NSHostingView(rootView: RecordingSetupView(model: model, geometry: geometry, onStart: onStart, onReturn: onReturn))
         super.init(window: panel)
@@ -535,6 +622,10 @@ private final class RecordingSetupWindowController: NSWindowController {
     func reposition() {
         guard let window else { return }
         let selection = geometry.selection
+        if selection.width >= window.frame.width, selection.height >= window.frame.height {
+            window.setFrameOrigin(NSPoint(x: screen.frame.minX + selection.midX - window.frame.width / 2, y: screen.frame.minY + selection.midY - window.frame.height / 2))
+            return
+        }
         let below = screen.frame.minY + selection.minY - window.frame.height - 8
         let above = screen.frame.minY + selection.maxY + 8
         let y = below >= screen.visibleFrame.minY ? below : min(above, screen.visibleFrame.maxY - window.frame.height)
@@ -550,24 +641,50 @@ private struct RecordingSetupView: View {
     let onReturn: () -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    soundGroup
-                    mouseGroup
-                    originalSizeGroup
-                    countdownGroup
-                }
-                .padding(12)
+        VStack(spacing: 16) {
+            Button(action: onStart) {
+                Image(nsImage: recordingAsset("record-start", size: NSSize(width: 208, height: 40))).resizable().frame(width: 208, height: 40)
             }
-            Divider()
-            footer
+                .keyboardShortcut(.defaultAction)
+                .frame(width: 208, height: 40)
+                .buttonStyle(.plain)
+            Rectangle().fill(Color.white.opacity(0.32)).frame(width: 208, height: 1)
+            HStack(spacing: 16) {
+                recordToggle("record-speaker", menu: false, isOn: plain(\.systemAudio))
+                recordToggle("record-microphone", isOn: binding(\.microphone, permission: .microphone))
+                recordToggle("record-camera", isOn: binding(\.cameraEnabled, permission: .camera))
+                mouseMenu
+            }
         }
-        .frame(width: 300, height: 320)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .padding(.horizontal, 24).padding(.vertical, 16)
+        .frame(width: 256, height: 140)
+        .background(Color(red: 51/255, green: 51/255, blue: 51/255), in: RoundedRectangle(cornerRadius: 12))
+        .shadow(color: .black.opacity(0.16), radius: 4, x: 0, y: 4)
         .onChange(of: model.settings) { model.persist() }
+    }
+
+    private func recordToggle(_ asset: String, menu: Bool = true, isOn: Binding<Bool>) -> some View {
+        Button { isOn.wrappedValue.toggle() } label: {
+            Image(nsImage: recordingAsset("\(asset)-\(isOn.wrappedValue ? "on" : "off")", size: NSSize(width: 40, height: 36))).resizable().frame(width: 40, height: 36)
+        }.buttonStyle(.plain)
+    }
+
+    private var mouseMenu: some View {
+        Menu {
+            Toggle("显示鼠标指针", isOn: plain(\.showsCursor))
+            Toggle("显示点击反馈", isOn: plain(\.showsClicks))
+        } label: {
+            Image(nsImage: recordingAsset("record-cursor-\((model.settings.showsCursor || model.settings.showsClicks) ? "on" : "off")", size: NSSize(width: 40, height: 36))).resizable().frame(width: 40, height: 36)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .frame(width: 40, height: 36)
+    }
+
+    private func recordingAsset(_ name: String, size: NSSize) -> NSImage {
+        let packaged = Bundle.main.resourceURL?.appendingPathComponent("ShotX_ShotX.bundle")
+        let bundle = packaged.flatMap(Bundle.init(url:)) ?? Bundle.module
+        return (bundle.url(forResource: name, withExtension: "svg").flatMap(NSImage.init(contentsOf:)) ?? NSImage()).shotXSized(size)
     }
 
     private var header: some View {
@@ -678,7 +795,8 @@ private final class RecordingRegionOverlayController {
     }
 
     private static func window(frame: CGRect, screen: NSScreen, opaque: Bool) -> NSWindow {
-        let window = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false, screen: screen)
+        let localFrame = frame.offsetBy(dx: -screen.frame.minX, dy: -screen.frame.minY)
+        let window = NSWindow(contentRect: localFrame, styleMask: .borderless, backing: .buffered, defer: false, screen: screen)
         window.isReleasedWhenClosed = false
         window.level = .screenSaver
         window.isOpaque = opaque
@@ -695,22 +813,19 @@ private final class RecordingRegionBorderView: NSView {
     override var isFlipped: Bool { false }
 
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.black.setStroke()
-        let outer = NSBezierPath(rect: bounds.insetBy(dx: 0.5, dy: 0.5)); outer.lineWidth = 3; outer.stroke()
-        NSColor.white.setStroke()
-        let inner = NSBezierPath(rect: bounds.insetBy(dx: 2, dy: 2)); inner.lineWidth = 2; inner.stroke()
-        drawCorners()
-        let label = NSAttributedString(string: state.label, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 13, weight: .bold), .foregroundColor: NSColor.white])
-        let size = label.size()
-        let rect = CGRect(x: 4, y: max(4, bounds.height - size.height - 10), width: size.width + 14, height: size.height + 8)
-        NSColor.black.withAlphaComponent(0.88).setFill(); NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill(); label.draw(at: CGPoint(x: rect.minX + 7, y: rect.minY + 4))
+        let border = NSColor(hex: state == .recording ? "#FA5151" : "#07C160")!
+        border.setStroke()
+        let rect = bounds.insetBy(dx: 3, dy: 3)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8); path.lineWidth = 1; path.stroke()
+        drawAccents(around: rect, color: border)
     }
 
-    private func drawCorners() {
-        NSColor.white.setStroke()
-        for (x, y, sx, sy) in [(3.0, 3.0, 1.0, 1.0), (bounds.maxX - 3, 3, -1, 1), (3, bounds.maxY - 3, 1, -1), (bounds.maxX - 3, bounds.maxY - 3, -1, -1)] {
-            let path = NSBezierPath(); path.move(to: CGPoint(x: x + 16 * sx, y: y)); path.line(to: CGPoint(x: x, y: y)); path.line(to: CGPoint(x: x, y: y + 16 * sy)); path.lineWidth = 3; path.stroke()
+    private func drawAccents(around rect: CGRect, color: NSColor) {
+        color.setStroke()
+        for (x, y, sx, sy) in [(rect.minX, rect.minY, 1.0, 1.0), (rect.maxX, rect.minY, -1.0, 1.0), (rect.minX, rect.maxY, 1.0, -1.0), (rect.maxX, rect.maxY, -1.0, -1.0)] {
+            let p = NSBezierPath(); p.move(to: CGPoint(x: x + 26 * sx, y: y)); p.line(to: CGPoint(x: x + 8 * sx, y: y)); p.curve(to: CGPoint(x: x, y: y + 8 * sy), controlPoint1: CGPoint(x: x + 3 * sx, y: y), controlPoint2: CGPoint(x: x, y: y + 3 * sy)); p.line(to: CGPoint(x: x, y: y + 29 * sy)); p.lineWidth = 3; p.lineCapStyle = .round; p.stroke()
         }
+        for (a, b) in [(CGPoint(x: rect.midX - 11, y: rect.minY), CGPoint(x: rect.midX + 11, y: rect.minY)), (CGPoint(x: rect.midX - 11, y: rect.maxY), CGPoint(x: rect.midX + 11, y: rect.maxY)), (CGPoint(x: rect.minX, y: rect.midY - 12), CGPoint(x: rect.minX, y: rect.midY + 12)), (CGPoint(x: rect.maxX, y: rect.midY - 12), CGPoint(x: rect.maxX, y: rect.midY + 12))] { let p = NSBezierPath(); p.move(to: a); p.line(to: b); p.lineWidth = 3; p.lineCapStyle = .round; p.stroke() }
     }
 }
 
@@ -718,43 +833,84 @@ private final class RecordingRegionBorderView: NSView {
 private final class RecordingStatusWindowController: NSWindowController {
     private let label = NSTextField(labelWithString: "")
     private let stopButton = NSButton(title: "停止", target: nil, action: nil)
+    private let stopBackground = NSImageView()
     private var timer: Timer?
     private var started = Date()
     private let sources: String
     private var onStop: () -> Void
+    private let screen: NSScreen
+    private let selection: CGRect
 
-    init(sources: String, onStop: @escaping () -> Void) {
+    init(screen: NSScreen, selection: CGRect, sources: String, onStop: @escaping () -> Void) {
         self.sources = sources
         self.onStop = onStop
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 280, height: 48), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        self.screen = screen
+        self.selection = selection
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 240, height: 72), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
         panel.level = .screenSaver
-        panel.backgroundColor = .windowBackgroundColor.withAlphaComponent(0.95)
+        panel.isMovable = false
+        panel.isMovableByWindowBackground = false
+        panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
         super.init(window: panel)
-        label.font = .monospacedDigitSystemFont(ofSize: 15, weight: .semibold)
+        label.font = .monospacedDigitSystemFont(ofSize: 16, weight: .bold); label.textColor = .white
         stopButton.target = self
         stopButton.action = #selector(stopPressed)
-        let stack = NSStackView(views: [label, NSView(), stopButton])
+        stopButton.isBordered = false; stopButton.font = .systemFont(ofSize: 18, weight: .bold); stopButton.wantsLayer = true; stopButton.layer?.backgroundColor = NSColor(hex: "#FA5151")?.cgColor; stopButton.layer?.cornerRadius = 12; stopButton.contentTintColor = .white
+        let stack = NSStackView(views: [stopButton, label])
         stack.orientation = .horizontal
-        stack.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 8)
-        panel.contentView = stack
-        panel.center()
+        stack.spacing = 10; stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 72)); root.wantsLayer = true; root.layer?.backgroundColor = NSColor(hex: "#333333")?.cgColor; root.layer?.cornerRadius = 12; root.addSubview(stack); stack.frame = root.bounds; panel.contentView = root
+        let visible = screen.visibleFrame
+        let x = min(max(visible.minX, screen.frame.minX + selection.midX - 120), visible.maxX - 240)
+        let below = screen.frame.minY + selection.minY - 80
+        let y = below >= visible.minY ? below : min(visible.maxY - 72, screen.frame.minY + selection.maxY + 8)
+        panel.setFrameOrigin(CGPoint(x: x, y: y))
     }
 
     required init?(coder: NSCoder) { fatalError() }
     func setOnStop(_ action: @escaping () -> Void) { onStop = action }
-    func showCountdown(_ value: Int) { label.stringValue = value > 0 ? "录制倒计时  \(value)" : "正在开始…"; stopButton.title = "取消"; showWindow(nil) }
+    func showCountdown(_ value: Int) {
+        guard value > 0 else { return }
+        timer?.invalidate()
+        let name = "record-countdown-\(value)"
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 120, height: 120)); root.wantsLayer = true; root.layer?.cornerRadius = 60; root.layer?.masksToBounds = true; root.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.3).cgColor
+        let number = NSImageView(image: recordingImage(name, size: NSSize(width: 40, height: 77))); number.imageScaling = .scaleProportionallyUpOrDown; number.frame = NSRect(x: 40, y: 21.5, width: 40, height: 77); root.addSubview(number)
+        window?.setContentSize(NSSize(width: 120, height: 120)); window?.contentView = root
+        window?.setFrameOrigin(CGPoint(x: screen.frame.minX + selection.midX - 60, y: screen.frame.minY + selection.midY - 60))
+        showWindow(nil)
+    }
     func showRecording(started: Date) {
         self.started = started
-        stopButton.title = "停止"
-        label.stringValue = "● REC  00:00  ·  \(sources)"
+        makeRecordingContent()
+        stopButton.title = ""
+        label.stringValue = "00:00"
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in Task { @MainActor in self?.tick() } }
     }
     func showProcessing() { timer?.invalidate(); label.stringValue = "正在保留可播放内容…"; stopButton.isEnabled = false }
     override func close() { timer?.invalidate(); super.close() }
     @objc private func stopPressed() { onStop() }
-    private func tick() { let seconds = Int(Date().timeIntervalSince(started)); label.stringValue = String(format: "● REC  %02d:%02d  ·  %@", seconds / 60, seconds % 60, sources) }
+    private func tick() {
+        let seconds = Int(Date().timeIntervalSince(started))
+        if seconds >= 3_600 { timer?.invalidate(); onStop(); return }
+        label.stringValue = String(format: "%02d:%02d", seconds / 60, seconds % 60)
+    }
+
+    private func makeRecordingContent() {
+        window?.setContentSize(NSSize(width: 240, height: 72))
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 72)); root.wantsLayer = true; root.layer?.backgroundColor = NSColor(hex: "#333333")?.cgColor; root.layer?.cornerRadius = 12; root.layer?.masksToBounds = true
+        stopBackground.image = recordingImage("record-stop", size: NSSize(width: 208, height: 40)); stopBackground.imageScaling = .scaleAxesIndependently; stopBackground.frame = NSRect(x: 16, y: 16, width: 208, height: 40); root.addSubview(stopBackground)
+        stopButton.frame = stopBackground.frame; stopButton.title = ""; stopButton.layer?.backgroundColor = NSColor.clear.cgColor; root.addSubview(stopButton)
+        label.frame = NSRect(x: 144, y: 26, width: 54, height: 20); label.alignment = .center; root.addSubview(label); window?.contentView = root
+        let visible = screen.visibleFrame; let x = min(max(visible.minX, screen.frame.minX + selection.midX - 120), visible.maxX - 240); let below = screen.frame.minY + selection.minY - 80; let y = below >= visible.minY ? below : min(visible.maxY - 72, screen.frame.minY + selection.maxY + 8); window?.setFrameOrigin(CGPoint(x: x, y: y))
+    }
+
+    private func recordingImage(_ name: String, size: NSSize) -> NSImage {
+        let packaged = Bundle.main.resourceURL?.appendingPathComponent("ShotX_ShotX.bundle")
+        let bundle = packaged.flatMap(Bundle.init(url:)) ?? Bundle.module
+        return (bundle.url(forResource: name, withExtension: "svg").flatMap(NSImage.init(contentsOf:)) ?? NSImage()).shotXSized(size)
+    }
 }

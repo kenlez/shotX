@@ -14,5 +14,6 @@
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
     <key>NSMicrophoneUsageDescription</key><string>仅在你启用麦克风录制时，将声音写入本地录屏。</string>
+    <key>NSCameraUsageDescription</key><string>仅在你启用摄像头录制时，将实时画面合成到本地录屏。</string>
 </dict>
 </plist>

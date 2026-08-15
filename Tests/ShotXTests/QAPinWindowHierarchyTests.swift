@@ -27,14 +27,12 @@ final class QAPinWindowHierarchyTests: XCTestCase {
 
         let hasImageView = all.contains { $0 is PinImageView }
         let hasSlider = all.contains { $0 is NSSlider }
-        let hasCloseButton = all.contains { ($0 as? NSButton)?.title == "关闭" }
-        let hasCloseCopyButton = all.contains { ($0 as? NSButton)?.title == "关闭并复制" }
-        let hasZoomLabel = all.contains { $0 is NSTextField }
+        let hasCloseButton = all.contains { ($0 as? NSButton)?.accessibilityLabel() == "关闭" }
+        let sliders = all.compactMap { $0 as? NSSlider }
 
         XCTAssertTrue(hasImageView, "image view must be a subview of the content view")
-        XCTAssertTrue(hasSlider, "opacity slider must be a subview")
+        XCTAssertTrue(hasSlider, "pin controls must include sliders")
         XCTAssertTrue(hasCloseButton, "关闭 button must be a subview")
-        XCTAssertTrue(hasCloseCopyButton, "关闭并复制 button must be a subview")
-        XCTAssertTrue(hasZoomLabel, "zoom label must be a subview")
+        XCTAssertEqual(sliders.count, 2, "pin controls must include opacity and zoom")
     }
 }

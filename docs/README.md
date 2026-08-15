@@ -5,9 +5,12 @@
 ## 产品 / 设计
 - `shotx-prd.md` — 产品需求文档（PRD）
 - `shotx-ux-ui-spec.md` — UX/UI 设计规范
+- `shotx-ux-ui-spec-BRA71.md` — BRA-71 交互标注（FR-BRA71-01…04、06，优先于既有规范冲突表述）
+- `shotx-ux-ui-spec-BRA82.md` — BRA-82 交互标注（截图/录屏工具栏、坐标与滚动状态；冲突点名见该文件 §9）
 
 ## 工程 / 实现
 - `IMPLEMENTATION.md` — P0 功能实现追踪表（含验证标记）
+- `FEATURE-AUDIT-2026-08-15.md` — 当前实现缺口、错误与验收风险
 - `description.md` — 当前任务的原始需求描述
 
 ## 规范
