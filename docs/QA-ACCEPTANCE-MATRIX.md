@@ -11,7 +11,7 @@
 
 | 检查 | 命令 | 说明 | 本次证据 |
 | --- | --- | --- | --- |
-| 单元/逻辑测试 | `swift test` | 不操控桌面 | 集成分支 0.1.2 冷缓存 37/37 通过（含 BRA-64/65/67 新增用例） |
+| 单元/逻辑测试 | `swift test` | 不操控桌面 | 远端 `main=af9089e` 干净检出冷缓存 37/37 通过（含 BRA-64/65/67 新增用例） |
 | Release 构建 | `make app` | 产出可分发 `ShotX.app` | 成功；Info.plist 版本写入 0.1.2 |
 | 签名校验 | `codesign --verify --deep --strict --verbose=2 ShotX.app` | 校验签名完整性与 DR | valid on disk，满足 Designated Requirement |
 | 静默冒烟启动 | 启动 `ShotX.app` 后确认进程存活并退出 | 不进行任何桌面操作 | 进程存活并正常退出 |

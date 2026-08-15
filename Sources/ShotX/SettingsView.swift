@@ -55,18 +55,27 @@ private struct ShortcutsPane: View {
 
     var body: some View {
         VStack(alignment: .leading) {
-            PaneTitle(title: "快捷键", detail: "点击快捷键后按下新组合；保存失败会保留旧值。")
+            PaneTitle(title: "通用与快捷键", detail: "快捷键默认关闭；点击按键框后录入组合，或随时清除。")
             Form {
-                ForEach(CaptureMode.allCases) { mode in
-                    LabeledContent(mode.rawValue) {
-                        VStack(alignment: .trailing, spacing: 3) {
-                            ShortcutRecorder(shortcut: model.shortcut(for: mode)) { candidate in
-                                switch model.updateShortcut(candidate, for: mode) {
-                                case .success: errors[mode] = nil
-                                case .failure(let error): errors[mode] = error.message
+                Section("启动") {
+                    Toggle("开机时启动 ShotX", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
+                }
+                Section("截图与录屏快捷键") {
+                    ForEach(CaptureMode.activeShortcutCases) { mode in
+                        LabeledContent(mode.displayName) {
+                            VStack(alignment: .trailing, spacing: 3) {
+                                HStack(spacing: 8) {
+                                    ShortcutRecorder(shortcut: model.shortcut(for: mode)) { candidate in
+                                        switch model.updateShortcut(candidate, for: mode) {
+                                        case .success: errors[mode] = nil
+                                        case .failure(let error): errors[mode] = error.message
+                                        }
+                                    }
+                                    Button("清除") { model.clearShortcut(for: mode); errors[mode] = nil }
+                                        .disabled(model.shortcut(for: mode).isEmpty)
                                 }
+                                if let error = errors[mode] { Text(error).font(.caption).foregroundStyle(.red) }
                             }
-                            if let error = errors[mode] { Text(error).font(.caption).foregroundStyle(.red) }
                         }
                     }
                 }
@@ -95,6 +104,7 @@ private struct RecordingPane: View {
             PaneTitle(title: "录屏", detail: "MP4 输出选区原始物理像素尺寸；来源只在你开启时申请权限。")
             Toggle("系统声音", isOn: toggle(\.systemAudio, permission: .systemAudio))
             Toggle("麦克风", isOn: toggle(\.microphone, permission: .microphone))
+            Toggle("摄像头画面", isOn: toggle(\.cameraEnabled, permission: .camera))
             Picker("麦克风设备", selection: plain(\.selectedMicrophoneID)) { Text("系统默认").tag(""); ForEach(Self.audioDevices(), id: \.uniqueID) { Text($0.localizedName).tag($0.uniqueID) } }.disabled(!model.settings.microphone)
             Toggle("显示指针", isOn: plain(\.showsCursor))
             Toggle("显示点击反馈", isOn: plain(\.showsClicks))
@@ -127,7 +137,7 @@ private struct PermissionsPane: View {
             }
         }
     }
-    private func icon(_ kind: PermissionKind) -> String { switch kind { case .screen: "display"; case .systemAudio: "speaker.wave.2"; case .microphone: "mic" } }
+    private func icon(_ kind: PermissionKind) -> String { switch kind { case .screen: "display"; case .systemAudio: "speaker.wave.2"; case .microphone: "mic"; case .camera: "video" } }
     private func actionTitle(_ kind: PermissionKind) -> String { model.permissions[kind] == .notDetermined ? "允许…" : "打开系统设置" }
 }
 
@@ -140,7 +150,7 @@ struct ShortcutRecorder: NSViewRepresentable {
 
 final class ShortcutButton: NSButton {
     var onChange: ((Shortcut) -> Void)?
-    var shortcut = Shortcut.defaults[.region]! { didSet { title = shortcut.label } }
+    var shortcut = Shortcut.none { didSet { title = shortcut.label } }
     fileprivate var recording = false
     override init(frame frameRect: NSRect) { super.init(frame: frameRect); bezelStyle = .rounded; setButtonType(.momentaryPushIn); target = self; action = #selector(beginRecording); toolTip = "点击后按下包含修饰键的快捷键" }
     required init?(coder: NSCoder) { fatalError() }
@@ -148,13 +158,15 @@ final class ShortcutButton: NSButton {
     override var acceptsFirstResponder: Bool { true }
     override func keyDown(with event: NSEvent) {
         guard recording else { super.keyDown(with: event); return }
+        if event.keyCode == UInt16(kVK_Delete) || event.keyCode == UInt16(kVK_ForwardDelete) { recording = false; onChange?(.none); return }
+        if event.keyCode == UInt16(kVK_Escape) { recording = false; title = shortcut.label; return }
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         var carbon: UInt32 = 0
         if modifiers.contains(.command) { carbon |= UInt32(cmdKey) }
         if modifiers.contains(.shift) { carbon |= UInt32(shiftKey) }
         if modifiers.contains(.option) { carbon |= UInt32(optionKey) }
         if modifiers.contains(.control) { carbon |= UInt32(controlKey) }
-        guard carbon != 0, event.keyCode != UInt16(kVK_Escape) else { recording = false; title = shortcut.label; return }
+        guard carbon != 0 else { return }
         recording = false
         let candidate = Shortcut(keyCode: UInt32(event.keyCode), modifiers: carbon)
         title = shortcut.label

@@ -1,0 +1,8 @@
+<svg preserveAspectRatio="none" overflow="visible" style="display: block;" width="22" height="22" viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g id="long_shot">
+<path id="Rectangle 4" d="M4 6.5V4C4 2.89543 4.89543 2 6 2H16C17.1046 2 18 2.89543 18 4V6.5M4 15.5V18C4 19.1046 4.89543 20 6 20H16C17.1046 20 18 19.1046 18 18V15.5" stroke="#D9D9D9" stroke-width="1.6" stroke-linecap="round"/>
+<path id="Rectangle 5" d="M4 9L4 13" stroke="#D9D9D9" stroke-width="1.6" stroke-linecap="round" stroke-dasharray="3.2 3.2"/>
+<path id="Rectangle 6" d="M18 9L18 13" stroke="#D9D9D9" stroke-width="1.6" stroke-linecap="round" stroke-dasharray="3.2 3.2"/>
+<path id="Rectangle 7" d="M11 6L11 11L11 16M8 8.5L11 6L14 8.5M8 13.5L11 16L14 13.5" stroke="#D9D9D9" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+</svg>
