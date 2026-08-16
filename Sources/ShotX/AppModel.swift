@@ -81,6 +81,9 @@ struct AppSettings: Codable, Equatable {
     var microphone = false
     // Optional keeps settings written by older ShotX builds decodable.
     private var camera: Bool? = false
+    private var cameraSizeValue: CameraOverlaySize?
+    private var cameraMirrorValue: Bool?
+    private var cameraBackgroundBlurValue: Bool?
     var selectedMicrophoneID = ""
     var showsCursor = true
     var showsClicks = true
@@ -94,6 +97,21 @@ struct AppSettings: Codable, Equatable {
     var cameraEnabled: Bool {
         get { camera ?? false }
         set { camera = newValue }
+    }
+    /// 画中画尺寸档位（BRA102-05，大/小两档）。
+    var cameraSize: CameraOverlaySize {
+        get { cameraSizeValue ?? .large }
+        set { cameraSizeValue = newValue }
+    }
+    /// 摄像头镜像（BRA102-06，默认开：自拍镜像习惯）。
+    var cameraMirror: Bool {
+        get { cameraMirrorValue ?? true }
+        set { cameraMirrorValue = newValue }
+    }
+    /// 摄像头模糊背景（BRA102-06，仅系统支持时展示并生效）。
+    var cameraBackgroundBlur: Bool {
+        get { cameraBackgroundBlurValue ?? false }
+        set { cameraBackgroundBlurValue = newValue }
     }
     func shortcut(for mode: CaptureMode) -> Shortcut { shortcuts[mode.rawValue] ?? .none }
 }
@@ -172,8 +190,18 @@ final class AppModel: ObservableObject {
 
     private let defaults: UserDefaults
     private let settingsKey = "settings.v1"
+    private let screenPermissionAskedKey = "screenPermissionAsked.v1"
     private let hotKeys = HotKeyManager()
     private var started = false
+
+    /// Injectable screen-permission request for tests; production uses the system prompt.
+    var requestScreenAccess: () -> Bool = { CGRequestScreenCaptureAccess() }
+
+    /// True once the user has gone through a screen-recording permission decision.
+    private(set) var screenPermissionAsked: Bool {
+        get { defaults.bool(forKey: screenPermissionAskedKey) }
+        set { defaults.set(newValue, forKey: screenPermissionAskedKey) }
+    }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -213,7 +241,22 @@ final class AppModel: ObservableObject {
             recentResult = .video(recovery, saved: false)
             errorMessage = "发现可恢复的录屏。可从“最近一次结果”预览、复制或另存。"
         }
-        Task { await refreshPermissions() }
+        Task {
+            await refreshPermissions()
+            requestScreenPermissionOnFirstLaunch()
+        }
+    }
+
+    /// BRA102-01: 全新安装首次启动即发起屏幕录制权限申请。此时不存在任何截图/录屏蒙层，
+    /// 且 App 被激活，系统权限弹窗自然位于最高层、可点击；非首次启动不自动弹窗。
+    func requestScreenPermissionOnFirstLaunch(currentStatus: PermissionState? = nil) {
+        guard !screenPermissionAsked else { return }
+        let status = currentStatus ?? permissions[.screen]
+        if status == .allowed {
+            screenPermissionAsked = true
+            return
+        }
+        requestScreenPermission()
     }
 
     func shortcut(for mode: CaptureMode) -> Shortcut { settings.shortcut(for: mode) }
@@ -275,7 +318,10 @@ final class AppModel: ObservableObject {
         Task {
             await refreshPermissions()
             guard permissions[.screen] == .allowed else {
-                requestScreenPermission()
+                // BRA102-01: 权限申请先于任何选区/蒙层。已询问过（拒绝/忽略）时进入权限拦截说明，
+                // 绝不先创建选区蒙层再弹系统权限弹窗（现状缺陷根因）。
+                if screenPermissionAsked { presentScreenPermissionInterception() }
+                else { requestScreenPermission() }
                 return
             }
             await CaptureCoordinator.shared.begin(mode: mode, model: self)
@@ -305,8 +351,25 @@ final class AppModel: ObservableObject {
     }
 
     func requestScreenPermission() {
-        if !CGRequestScreenCaptureAccess() { openPrivacySettings(.screen) }
+        // BRA102-01: 任何系统权限请求发起时不得存在 .screenSaver 级蒙层。先清掉捕获浮层再申请，
+        // 避免系统权限弹窗被蒙层盖住无法点击。
+        CaptureCoordinator.shared.cancel()
+        if let app = NSApp { app.activate(ignoringOtherApps: true) }
+        let firstAsk = !screenPermissionAsked
+        screenPermissionAsked = true
+        let granted = requestScreenAccess()
+        // 首次弹出被点「不允许」时不要紧接着强拉系统设置；之后再次请求才引导打开系统设置。
+        if !granted, !firstAsk { openPrivacySettings(.screen) }
         Task { await refreshPermissions() }
+    }
+
+    private func presentScreenPermissionInterception() {
+        let alert = NSAlert()
+        alert.messageText = "需要屏幕录制权限"
+        alert.informativeText = "ShotX 需要屏幕录制权限才能截取或录制屏幕。内容只在这台 Mac 上处理。"
+        alert.addButton(withTitle: "打开系统设置")
+        alert.addButton(withTitle: "取消")
+        if alert.runModal() == .alertFirstButtonReturn { openPrivacySettings(.screen) }
     }
 
     func request(_ kind: PermissionKind) {
@@ -314,9 +377,20 @@ final class AppModel: ObservableObject {
         case .screen: requestScreenPermission()
         case .systemAudio: openPrivacySettings(.screen)
         case .microphone:
-            AVCaptureDevice.requestAccess(for: .audio) { [weak self] _ in Task { await self?.refreshPermissions() } }
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                Task { @MainActor in
+                    // BRA102-02/UX 标注：拒绝后对应开关自动关闭，不保留开启的假状态。
+                    if !granted { self?.settings.microphone = false; self?.persist(); self?.showError("麦克风不可用。你仍可继续无麦克风录制。") }
+                    await self?.refreshPermissions()
+                }
+            }
         case .camera:
-            AVCaptureDevice.requestAccess(for: .video) { [weak self] _ in Task { await self?.refreshPermissions() } }
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                Task { @MainActor in
+                    if !granted { self?.settings.cameraEnabled = false; self?.persist(); self?.showError("摄像头不可用。你仍可继续无摄像头录制。") }
+                    await self?.refreshPermissions()
+                }
+            }
         }
     }
 

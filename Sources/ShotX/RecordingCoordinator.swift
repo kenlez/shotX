@@ -31,6 +31,7 @@ struct CaptureGeometry {
 @MainActor
 private final class RecordingSetupGeometry: ObservableObject {
     @Published var selection: CGRect
+    @Published var cameraHint: String?
     let scale: CGFloat
     init(selection: CGRect, scale: CGFloat) {
         self.selection = selection
@@ -69,14 +70,128 @@ enum RecordingOutputSize {
     }
 }
 
+enum CameraOverlaySize: String, Codable, CaseIterable, Identifiable {
+    case small, large
+    var id: String { rawValue }
+    var side: CGFloat { self == .small ? 96 : 192 }
+    var displayName: String { self == .small ? "小" : "大" }
+}
+
 enum CameraOverlayLayout {
-    static func rect(in bounds: CGRect) -> CGRect {
-        let margin = min(12, bounds.width / 10, bounds.height / 10)
-        let availableWidth = max(1, bounds.width - margin * 2)
-        let availableHeight = max(1, bounds.height - margin * 2)
-        let width = min(240, availableWidth, availableHeight * 4 / 3, max(80, bounds.width * 0.28))
-        let height = width * 3 / 4
-        return CGRect(x: bounds.maxX - margin - width, y: bounds.minY + margin, width: width, height: height)
+    static let margin: CGFloat = 12
+    static let cornerRadius: CGFloat = 12
+    static let minimumSide: CGFloat = 64
+
+    /// 圆角正方形画中画矩形，锚定在选区左下角、带 margin（BRA102-04）。
+    /// `scale` 把设计点值换算到调用方坐标系：预览窗为 1（点），成片合成为 backingScaleFactor（像素），
+    /// 两处调用同一布局函数保证设置态预览与成片逐像素一致（BRA102-07）。
+    /// 选区过小（最小档 + margin 放不下）时返回 nil，调用方应隐藏画中画并提示。
+    static func rect(in bounds: CGRect, size: CameraOverlaySize, scale: CGFloat = 1) -> CGRect? {
+        let margin = margin * scale
+        let available = min(bounds.width, bounds.height) - margin * 2
+        let minimum = minimumSide * scale
+        guard available >= minimum else { return nil }
+        let side = min(size.side * scale, available)
+        return CGRect(x: bounds.minX + margin, y: bounds.minY + margin, width: side, height: side)
+    }
+}
+
+/// 摄像头会话。设置态开启摄像头开关即启动（BRA102-03），录制前就绪，录制期间持续供帧；
+/// 同时服务画中画预览层与成片合成帧，保证预览与成片一致（BRA102-07）。
+final class CameraSession: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    static func hasAvailableDevice() -> Bool { AVCaptureDevice.default(for: .video) != nil }
+
+    /// 模糊背景能力检测：仅当系统人像效果支持时展示对应开关（BRA102-06，不支持不显示、不冒充）。
+    static func supportsBackgroundBlur() -> Bool {
+        guard let device = AVCaptureDevice.default(for: .video) else { return false }
+        return device.activeFormat.isPortraitEffectSupported
+    }
+
+    private let queue = DispatchQueue(label: "ShotX.camera")
+    private let lock = NSLock()
+    private var latest: CIImage?
+    private var output: AVCaptureVideoDataOutput?
+    private var disconnectObserver: NSObjectProtocol?
+    private var started = false
+
+    private(set) var session: AVCaptureSession?
+    private(set) var device: AVCaptureDevice?
+    var onDisconnect: (() -> Void)?
+
+    /// 最新摄像头帧；成片合成时读取（nil 表示暂无帧，录屏不含画中画）。
+    var latestFrame: CIImage? {
+        lock.lock(); defer { lock.unlock() }
+        return latest
+    }
+
+    @discardableResult
+    func start(settings: AppSettings) -> Bool {
+        guard !started, let device = AVCaptureDevice.default(for: .video) else { return false }
+        do {
+            let input = try AVCaptureDeviceInput(device: device)
+            let session = AVCaptureSession()
+            session.beginConfiguration()
+            session.sessionPreset = .medium
+            guard session.canAddInput(input) else { return false }
+            session.addInput(input)
+            let output = AVCaptureVideoDataOutput()
+            output.alwaysDiscardsLateVideoFrames = true
+            output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            output.setSampleBufferDelegate(self, queue: queue)
+            guard session.canAddOutput(output) else { return false }
+            session.addOutput(output)
+            session.commitConfiguration()
+            self.session = session
+            self.output = output
+            self.device = device
+            session.startRunning()
+            started = true
+            installDisconnectObserver()
+            applyBackgroundBlur(settings.cameraBackgroundBlur)
+            return true
+        } catch {
+            self.session = nil
+            self.output = nil
+            self.device = nil
+            return false
+        }
+    }
+
+    func stop() {
+        if let disconnectObserver { NotificationCenter.default.removeObserver(disconnectObserver) }
+        disconnectObserver = nil
+        output = nil
+        session?.stopRunning()
+        session = nil
+        device = nil
+        started = false
+        lock.lock()
+        latest = nil
+        lock.unlock()
+    }
+
+    /// 模糊背景仅当系统人像效果当前处于活动态才真实生效（macOS 由「控制中心」人像效果控制，
+    /// 应用无法编程强制）；返回是否实际生效，调用方据此提示/回退，杜绝假实现。
+    @discardableResult
+    func applyBackgroundBlur(_ enabled: Bool) -> Bool {
+        guard let device else { return false }
+        guard enabled, device.activeFormat.isPortraitEffectSupported else { return false }
+        return device.isPortraitEffectActive
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard output === self.output, let pixel = sampleBuffer.imageBuffer else { return }
+        lock.lock()
+        latest = CIImage(cvPixelBuffer: pixel)
+        lock.unlock()
+    }
+
+    private func installDisconnectObserver() {
+        disconnectObserver = NotificationCenter.default.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: nil, queue: nil) { [weak self] notification in
+            guard let self, let device = notification.object as? AVCaptureDevice, device.hasMediaType(.video), device == self.device else { return }
+            self.stop()
+            DispatchQueue.main.async { self.onDisconnect?() }
+        }
     }
 }
 
@@ -109,6 +224,7 @@ final class RecordingCoordinator: NSObject {
     private var setup: RecordingSetupWindowController?
     private var overlay: RecordingRegionOverlayController?
     private var cameraPreview: CameraPreviewWindowController?
+    private var cameraSession: CameraSession?
     private var geometry: RecordingSetupGeometry?
     private weak var selection: SelectionWindowController?
     private var countdownTask: Task<Void, Never>?
@@ -140,14 +256,122 @@ final class RecordingCoordinator: NSObject {
         let rect = selection?.selectionRect ?? pending.rect
         let geometry = RecordingSetupGeometry(selection: rect, scale: pending.screen.backingScaleFactor)
         self.geometry = geometry
-        setup = RecordingSetupWindowController(model: model, screen: pending.screen, geometry: geometry, onStart: { [weak self] in self?.beginCountdown() }, onReturn: { [weak self] in self?.returnToSelection() })
+        setup = RecordingSetupWindowController(model: model, screen: pending.screen, geometry: geometry, onStart: { [weak self] in self?.beginCountdown() }, onReturn: { [weak self] in self?.returnToSelection() }, onCameraChanged: { [weak self] enabled in self?.setCamera(enabled) }, onCameraPermissionChanged: { [weak self] state in self?.cameraPermissionChanged(state) }, onCameraSettingsChanged: { [weak self] in self?.updateCameraSettings() })
         setup?.showWindow(nil)
         setup?.window?.makeKeyAndOrderFront(nil)
+        syncCamera()
     }
 
     private func updateSetupGeometry(_ rect: CGRect) {
         geometry?.selection = rect
         setup?.reposition()
+        updateCameraPreview()
+    }
+
+    /// 摄像头开启/关闭（BRA102-03）：开启即按需申请权限并启动会话，无需等录制开始。
+    private func setCamera(_ enabled: Bool) {
+        guard let model else { return }
+        model.settings.cameraEnabled = enabled
+        if enabled {
+            switch model.permissions[.camera] {
+            case .allowed: startCameraSession()
+            case .notDetermined:
+                model.request(.camera)
+                // 授权回调刷新权限后由 cameraPermissionChanged 启动会话。
+            default:
+                model.settings.cameraEnabled = false
+                model.showError("摄像头不可用。你仍可继续无摄像头录制。")
+            }
+        } else {
+            stopCameraSession()
+        }
+    }
+
+    /// 摄像头权限状态变化（授权回调刷新后），权限就绪且开关仍开启时启动会话。
+    private func cameraPermissionChanged(_ state: PermissionState?) {
+        guard state == .allowed, model?.settings.cameraEnabled == true else { return }
+        startCameraSession()
+    }
+
+    /// 打开设置面板/权限就绪后调用：若开关开启且已授权则启动会话 + 显示预览。
+    private func syncCamera() {
+        guard model?.settings.cameraEnabled == true, model?.permissions[.camera] == .allowed else { return }
+        startCameraSession()
+    }
+
+    private func startCameraSession() {
+        guard let model, cameraSession == nil, model.settings.cameraEnabled, model.permissions[.camera] == .allowed else { return }
+        guard CameraSession.hasAvailableDevice() else {
+            model.settings.cameraEnabled = false
+            model.persist()
+            model.showError("未找到摄像头")
+            return
+        }
+        let session = CameraSession()
+        session.onDisconnect = { [weak self] in self?.cameraDisconnected() }
+        guard session.start(settings: model.settings) else {
+            model.settings.cameraEnabled = false
+            model.persist()
+            model.showError("无法启动摄像头。你仍可继续无摄像头录制。")
+            return
+        }
+        cameraSession = session
+        if model.settings.cameraBackgroundBlur, !session.applyBackgroundBlur(true) {
+            model.settings.cameraBackgroundBlur = false
+            model.showError("背景模糊需要系统「人像效果」支持。请在控制中心开启后重试。")
+        }
+        updateCameraPreview()
+    }
+
+    private func stopCameraSession() {
+        cameraSession?.onDisconnect = nil
+        cameraSession?.stop()
+        cameraSession = nil
+        cameraPreview?.close()
+        cameraPreview = nil
+        geometry?.cameraHint = nil
+    }
+
+    /// 摄像头设备断开（录制中/设置态）：关闭画中画并明确提示，录屏其余轨不受影响。
+    private func cameraDisconnected() {
+        cameraSession = nil
+        cameraPreview?.close()
+        cameraPreview = nil
+        geometry?.cameraHint = nil
+        model?.showError("摄像头已断开，其他来源仍在录制。")
+    }
+
+    /// 尺寸/设置变化后同步预览与提示（BRA102-05/06/07），选区过小则隐藏并提示。
+    private func updateCameraSettings() {
+        if let session = cameraSession {
+            if model?.settings.cameraBackgroundBlur == true, !session.applyBackgroundBlur(true) {
+                model?.settings.cameraBackgroundBlur = false
+                model?.showError("背景模糊需要系统「人像效果」支持。请在控制中心开启后重试。")
+            } else {
+                session.applyBackgroundBlur(model?.settings.cameraBackgroundBlur == true)
+            }
+        }
+        updateCameraPreview()
+    }
+
+    /// 画中画预览窗随选区/尺寸实时更新；选区过小时隐藏并提示（CAM-too-small）。
+    private func updateCameraPreview() {
+        guard cameraSession != nil, let model, let pending else { return }
+        let selection = geometry?.selection ?? pending.rect
+        guard CameraOverlayLayout.rect(in: CGRect(origin: .zero, size: selection.size), size: model.settings.cameraSize) != nil else {
+            geometry?.cameraHint = "选区过小，无法显示摄像头画面"
+            cameraPreview?.close()
+            cameraPreview = nil
+            return
+        }
+        geometry?.cameraHint = nil
+        if let cameraPreview {
+            cameraPreview.update(selection: selection, size: model.settings.cameraSize, mirror: model.settings.cameraMirror)
+        } else if let session = cameraSession?.session {
+            let preview = CameraPreviewWindowController(session: session, screen: pending.screen, selection: selection, size: model.settings.cameraSize, mirror: model.settings.cameraMirror)
+            preview.show()
+            cameraPreview = preview
+        }
     }
 
     /// Skips the settings panel and starts recording with the current selection + default settings,
@@ -158,6 +382,7 @@ final class RecordingCoordinator: NSObject {
         pending = (display, screen, localRect, mode)
         overlay = RecordingRegionOverlayController(screen: screen, selection: localRect)
         overlay?.show(state: .setup)
+        syncCamera()
         beginCountdown()
     }
 
@@ -222,16 +447,12 @@ final class RecordingCoordinator: NSObject {
             let source = CGRect(x: max(0, localRect.minX), y: max(0, screen.frame.height - localRect.maxY), width: localRect.width, height: localRect.height).integral
             let output = RecordingOutputSize.pixels(source: source.size, scale: scale)
             let url = try RecoveryStore.newURL()
-            let recorder = try ScreenRecorder(url: url, filter: filter, screenFrame: screen.frame, sourceRect: source, width: Int(output.width), height: Int(output.height), settings: settings, onNotice: { [weak model] message in
+            let recorder = try ScreenRecorder(url: url, filter: filter, screenFrame: screen.frame, sourceRect: source, width: Int(output.width), height: Int(output.height), settings: settings, cameraFeed: cameraSession, onNotice: { [weak model] message in
                 Task { @MainActor in model?.showError(message) }
             }) { [weak self] result in
                 Task { @MainActor in self?.finished(result) }
             }
             self.recorder = recorder
-            if let cameraSession = recorder.cameraSession {
-                cameraPreview = CameraPreviewWindowController(session: cameraSession, screen: screen, selection: localRect)
-                cameraPreview?.show()
-            }
             model?.setRecording(true)
             CaptureCoordinator.shared.cancel()
             selection = nil
@@ -254,8 +475,7 @@ final class RecordingCoordinator: NSObject {
         status = nil
         overlay?.close()
         overlay = nil
-        cameraPreview?.close()
-        cameraPreview = nil
+        stopCameraSession()
         selection = nil
         pending = nil
         switch result {
@@ -272,15 +492,15 @@ final class RecordingCoordinator: NSObject {
         status = nil
         overlay?.close()
         overlay = nil
-        cameraPreview?.close()
-        cameraPreview = nil
         guard recorder == nil, let pending, let model else { return }
         if let selection {
+            // 倒计时 Esc 返回设置态：画中画预览保持显示，选区/尺寸可继续调整（UX 标注 §2.5）。
             selection.showForSetup()
             openSetupPanel()
             installMenuTrackingObserver()
             installEscapeMonitor { [weak self] in self?.returnToSelection() }
         } else {
+            stopCameraSession()
             Task { await CaptureCoordinator.shared.begin(mode: pending.mode, model: model, targetScreen: pending.screen) }
         }
     }
@@ -293,6 +513,7 @@ final class RecordingCoordinator: NSObject {
             setup?.close()
             setup = nil
             geometry = nil
+            stopCameraSession()
             selection.exitRecordingSetup()
             self.selection = nil
             if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor); self.escapeMonitor = nil }
@@ -355,8 +576,7 @@ final class RecordingCoordinator: NSObject {
         status = nil
         overlay?.close()
         overlay = nil
-        cameraPreview?.close()
-        cameraPreview = nil
+        stopCameraSession()
         geometry = nil
         selection = nil
         pending = nil
@@ -391,18 +611,22 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
     private var clickMonitor: Any?
     private var sourceSession: AVCaptureSession?
     private var microphoneOutput: AVCaptureAudioDataOutput?
-    private var cameraOutput: AVCaptureVideoDataOutput?
-    private var latestCameraFrame: CIImage?
+    private var cameraFeed: CameraSession?
+    private let cameraSize: CameraOverlaySize
+    private let cameraMirror: Bool
+    private let cameraScale: CGFloat
     private var disconnectObserver: NSObjectProtocol?
     private let onNotice: (String) -> Void
     private var warnedDisk = false
 
-    var cameraSession: AVCaptureSession? { cameraOutput == nil ? nil : sourceSession }
-
-    init(url: URL, filter: SCContentFilter, screenFrame: CGRect, sourceRect: CGRect, width: Int, height: Int, settings: AppSettings, onNotice: @escaping (String) -> Void, completion: @escaping (Result<URL, Error>) -> Void) throws {
+    init(url: URL, filter: SCContentFilter, screenFrame: CGRect, sourceRect: CGRect, width: Int, height: Int, settings: AppSettings, cameraFeed: CameraSession?, onNotice: @escaping (String) -> Void, completion: @escaping (Result<URL, Error>) -> Void) throws {
         self.url = url
         self.completion = completion
         self.onNotice = onNotice
+        self.cameraFeed = cameraFeed
+        cameraSize = settings.cameraSize
+        cameraMirror = settings.cameraMirror
+        cameraScale = sourceRect.width > 0 ? CGFloat(width) / sourceRect.width : 1
         self.width = width; self.height = height; self.screenFrame = screenFrame; self.sourceRect = sourceRect; showsClicks = settings.showsClicks
         writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         video = AVAssetWriterInput(mediaType: .video, outputSettings: [
@@ -448,7 +672,7 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
         super.init()
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         if settings.systemAudio { try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue) }
-        if settings.microphone || settings.cameraEnabled { sourceSession = try makeSourceSession(settings: settings) }
+        if settings.microphone { sourceSession = try makeSourceSession(settings: settings) }
         disconnectObserver = NotificationCenter.default.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: nil, queue: nil) { [weak self] notification in
             guard let self, let device = notification.object as? AVCaptureDevice else { return }
             self.queue.async {
@@ -503,7 +727,7 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
         guard let source = sample.imageBuffer, let pool = videoAdaptor.pixelBufferPool else { return }
         var target: CVPixelBuffer?; guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &target) == kCVReturnSuccess, let target else { return }
         var image = CIImage(cvPixelBuffer: source)
-        if let camera = latestCameraFrame { image = composite(camera: camera, over: image) }
+        if let camera = cameraFeed?.latestFrame { image = composite(camera: camera, over: image) }
         if let (point, date) = lastClick, Date().timeIntervalSince(date) < 0.3, let ring = clickRing(at: point) { image = ring.composited(over: image) }
         ciContext.render(image, to: target, bounds: CGRect(x: 0, y: 0, width: width, height: height), colorSpace: CGColorSpaceCreateDeviceRGB())
         videoAdaptor.append(target, withPresentationTime: sample.presentationTimeStamp)
@@ -514,28 +738,19 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
         if settings.microphone, let device = Self.device(mediaType: .audio, id: settings.selectedMicrophoneID) {
             try session.addInput(AVCaptureDeviceInput(device: device)); let output = AVCaptureAudioDataOutput(); output.setSampleBufferDelegate(self, queue: queue); session.addOutput(output); microphoneOutput = output
         }
-        if settings.cameraEnabled, let device = AVCaptureDevice.default(for: .video) {
-            try session.addInput(AVCaptureDeviceInput(device: device))
-            let output = AVCaptureVideoDataOutput()
-            output.alwaysDiscardsLateVideoFrames = true
-            output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-            output.setSampleBufferDelegate(self, queue: queue)
-            session.addOutput(output)
-            cameraOutput = output
-        }
         session.commitConfiguration(); return session
     }
 
     private static func device(mediaType: AVMediaType, id: String) -> AVCaptureDevice? { id.isEmpty ? AVCaptureDevice.default(for: mediaType) : AVCaptureDevice(uniqueID: id) }
 
     private func composite(camera: CIImage, over screen: CIImage) -> CIImage {
-        let rect = CameraOverlayLayout.rect(in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let rect = CameraOverlayLayout.rect(in: CGRect(x: 0, y: 0, width: width, height: height), size: cameraSize, scale: cameraScale) else { return screen }
         let normalized = camera.transformed(by: CGAffineTransform(translationX: -camera.extent.minX, y: -camera.extent.minY))
-        let mirrored = normalized.transformed(by: CGAffineTransform(translationX: normalized.extent.width, y: 0).scaledBy(x: -1, y: 1))
-        let scale = max(rect.width / mirrored.extent.width, rect.height / mirrored.extent.height)
-        let scaled = mirrored.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let oriented = cameraMirror ? normalized.transformed(by: CGAffineTransform(translationX: normalized.extent.width, y: 0).scaledBy(x: -1, y: 1)) : normalized
+        let scale = max(rect.width / oriented.extent.width, rect.height / oriented.extent.height)
+        let scaled = oriented.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
         let positioned = scaled.transformed(by: CGAffineTransform(translationX: rect.midX - scaled.extent.midX, y: rect.midY - scaled.extent.midY)).cropped(to: rect)
-        guard let mask = CIFilter(name: "CIRoundedRectangleGenerator", parameters: ["inputExtent": CIVector(cgRect: rect), "inputRadius": 12, "inputColor": CIColor.white])?.outputImage else { return positioned.composited(over: screen) }
+        guard let mask = CIFilter(name: "CIRoundedRectangleGenerator", parameters: ["inputExtent": CIVector(cgRect: rect), "inputRadius": CameraOverlayLayout.cornerRadius * cameraScale, "inputColor": CIColor.white])?.outputImage else { return positioned.composited(over: screen) }
         let clear = CIImage(color: .clear).cropped(to: rect)
         let rounded = positioned.applyingFilter("CIBlendWithMask", parameters: [kCIInputBackgroundImageKey: clear, kCIInputMaskImageKey: mask])
         return rounded.composited(over: screen)
@@ -558,21 +773,22 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
     }
 }
 
-extension ScreenRecorder: AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
+extension ScreenRecorder: AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         if output === microphoneOutput, started, let microphone, microphone.isReadyForMoreMediaData { microphone.append(sampleBuffer) }
-        else if output === cameraOutput, let pixel = sampleBuffer.imageBuffer { latestCameraFrame = CIImage(cvPixelBuffer: pixel) }
     }
 }
 
 @MainActor
 private final class CameraPreviewWindowController {
     private let window: NSPanel
+    private let preview: AVCaptureVideoPreviewLayer
+    private let screen: NSScreen
 
-    init(session: AVCaptureSession, screen: NSScreen, selection: CGRect) {
-        let local = CameraOverlayLayout.rect(in: CGRect(origin: .zero, size: selection.size))
-        let frame = local.offsetBy(dx: screen.frame.minX + selection.minX, dy: screen.frame.minY + selection.minY)
-        window = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+    init(session: AVCaptureSession, screen: NSScreen, selection: CGRect, size: CameraOverlaySize, mirror: Bool) {
+        self.screen = screen
+        preview = AVCaptureVideoPreviewLayer(session: session)
+        window = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         window.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 2)
         window.backgroundColor = .clear
         window.isOpaque = false
@@ -582,10 +798,27 @@ private final class CameraPreviewWindowController {
         window.isMovableByWindowBackground = false
         window.sharingType = .none
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        let view = NSView(frame: CGRect(origin: .zero, size: frame.size)); view.wantsLayer = true
-        let preview = AVCaptureVideoPreviewLayer(session: session); preview.frame = view.bounds; preview.videoGravity = .resizeAspectFill; preview.cornerRadius = 12; preview.masksToBounds = true
+        let view = NSView(frame: .zero); view.wantsLayer = true
+        preview.videoGravity = .resizeAspectFill
+        preview.cornerRadius = CameraOverlayLayout.cornerRadius
+        preview.masksToBounds = true
         view.layer?.addSublayer(preview)
         window.contentView = view
+        update(selection: selection, size: size, mirror: mirror)
+    }
+
+    /// 随选区/尺寸/镜像实时更新预览位置、形态与镜像（BRA102-05/06/07）。
+    func update(selection: CGRect, size: CameraOverlaySize, mirror: Bool) {
+        guard let local = CameraOverlayLayout.rect(in: CGRect(origin: .zero, size: selection.size), size: size) else { return }
+        let frame = local.offsetBy(dx: screen.frame.minX + selection.minX, dy: screen.frame.minY + selection.minY)
+        window.setFrame(frame, display: true)
+        let content = window.contentView ?? NSView(frame: CGRect(origin: .zero, size: frame.size))
+        content.frame = CGRect(origin: .zero, size: frame.size)
+        preview.frame = content.bounds
+        if let connection = preview.connection {
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = mirror
+        }
     }
 
     func show() { window.orderFrontRegardless() }
@@ -596,10 +829,14 @@ private final class CameraPreviewWindowController {
 private final class RecordingSetupWindowController: NSWindowController {
     private let screen: NSScreen
     private let geometry: RecordingSetupGeometry
+    private let hosting: NSHostingView<RecordingSetupView>
+    private var hintObserver: Any?
 
-    init(model: AppModel, screen: NSScreen, geometry: RecordingSetupGeometry, onStart: @escaping () -> Void, onReturn: @escaping () -> Void) {
+    init(model: AppModel, screen: NSScreen, geometry: RecordingSetupGeometry, onStart: @escaping () -> Void, onReturn: @escaping () -> Void, onCameraChanged: @escaping (Bool) -> Void, onCameraPermissionChanged: @escaping (PermissionState?) -> Void, onCameraSettingsChanged: @escaping () -> Void) {
         self.screen = screen
         self.geometry = geometry
+        let view = RecordingSetupView(model: model, geometry: geometry, onStart: onStart, onReturn: onReturn, onCameraChanged: onCameraChanged, onCameraPermissionChanged: onCameraPermissionChanged, onCameraSettingsChanged: onCameraSettingsChanged)
+        hosting = NSHostingView(rootView: view)
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 256, height: 140), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
         panel.titleVisibility = .hidden
@@ -612,12 +849,24 @@ private final class RecordingSetupWindowController: NSWindowController {
         panel.isOpaque = false
         panel.hasShadow = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        panel.contentView = NSHostingView(rootView: RecordingSetupView(model: model, geometry: geometry, onStart: onStart, onReturn: onReturn))
+        panel.contentView = hosting
         super.init(window: panel)
+        hintObserver = geometry.$cameraHint.sink { [weak self] _ in
+            Task { @MainActor in self?.resizeToFit() }
+        }
+        resizeToFit()
         reposition()
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    private func resizeToFit() {
+        guard let window else { return }
+        let fitting = hosting.fittingSize
+        let size = CGSize(width: max(256, fitting.width.rounded()), height: max(140, fitting.height.rounded()))
+        window.setContentSize(size)
+        reposition()
+    }
 
     func reposition() {
         guard let window else { return }
@@ -639,6 +888,9 @@ private struct RecordingSetupView: View {
     @ObservedObject var geometry: RecordingSetupGeometry
     let onStart: () -> Void
     let onReturn: () -> Void
+    let onCameraChanged: (Bool) -> Void
+    let onCameraPermissionChanged: (PermissionState?) -> Void
+    let onCameraSettingsChanged: () -> Void
 
     var body: some View {
         VStack(spacing: 16) {
@@ -652,21 +904,52 @@ private struct RecordingSetupView: View {
             HStack(spacing: 16) {
                 recordToggle("record-speaker", menu: false, isOn: plain(\.systemAudio))
                 recordToggle("record-microphone", isOn: binding(\.microphone, permission: .microphone))
-                recordToggle("record-camera", isOn: binding(\.cameraEnabled, permission: .camera))
+                cameraMenu
                 mouseMenu
+            }
+            if let hint = geometry.cameraHint {
+                Text(hint).font(.caption).foregroundStyle(.white.opacity(0.85)).frame(maxWidth: .infinity)
             }
         }
         .padding(.horizontal, 24).padding(.vertical, 16)
-        .frame(width: 256, height: 140)
+        .frame(width: 256)
         .background(Color(red: 51/255, green: 51/255, blue: 51/255), in: RoundedRectangle(cornerRadius: 12))
         .shadow(color: .black.opacity(0.16), radius: 4, x: 0, y: 4)
-        .onChange(of: model.settings) { model.persist() }
+        .onChange(of: model.settings) { model.persist(); onCameraSettingsChanged() }
+        .onChange(of: model.permissions[.camera]) { _, newValue in onCameraPermissionChanged(newValue) }
     }
 
     private func recordToggle(_ asset: String, menu: Bool = true, isOn: Binding<Bool>) -> some View {
         Button { isOn.wrappedValue.toggle() } label: {
             Image(nsImage: recordingAsset("\(asset)-\(isOn.wrappedValue ? "on" : "off")", size: NSSize(width: 40, height: 36))).resizable().frame(width: 40, height: 36)
         }.buttonStyle(.plain)
+    }
+
+    private var cameraBinding: Binding<Bool> {
+        Binding(get: { model.settings.cameraEnabled }, set: { onCameraChanged($0) })
+    }
+
+    private var cameraSupportsBackgroundBlur: Bool { CameraSession.supportsBackgroundBlur() }
+
+    /// 摄像头图标展开浮层：启用开关 + 尺寸（小/大）+ 镜像/模糊背景（系统支持时）（BRA102-05/06）。
+    private var cameraMenu: some View {
+        Menu {
+            Toggle("启用摄像头", isOn: cameraBinding)
+            Divider()
+            Picker("尺寸", selection: plain(\.cameraSize)) {
+                Text(CameraOverlaySize.small.displayName).tag(CameraOverlaySize.small)
+                Text(CameraOverlaySize.large.displayName).tag(CameraOverlaySize.large)
+            }
+            Toggle("镜像", isOn: plain(\.cameraMirror))
+            if cameraSupportsBackgroundBlur { Toggle("模糊背景", isOn: plain(\.cameraBackgroundBlur)) }
+        } label: {
+            Image(nsImage: recordingAsset("record-camera-\((model.settings.cameraEnabled) ? "on" : "off")", size: NSSize(width: 40, height: 36))).resizable().frame(width: 40, height: 36)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .frame(width: 40, height: 36)
+        .accessibilityLabel("摄像头")
+        .accessibilityValue(model.settings.cameraEnabled ? "已开启" : "已关闭")
     }
 
     private var mouseMenu: some View {
