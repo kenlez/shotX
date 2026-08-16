@@ -1,4 +1,4 @@
-VERSION ?= 0.1.2
+VERSION ?= 0.1.14
 APP_NAME := ShotX
 ICON_PNG := icon/shotx.png
 ICON_ICNS := .build/ShotX.icns
