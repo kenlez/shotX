@@ -26,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppFonts.register()
         NSApp.setActivationPolicy(.accessory)
         DispatchQueue.main.async { [weak self] in self?.model?.start() }
         NotificationCenter.default.addObserver(self, selector: #selector(becameActive), name: NSApplication.didBecomeActiveNotification, object: nil)

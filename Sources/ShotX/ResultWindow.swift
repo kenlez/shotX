@@ -237,7 +237,7 @@ final class AnnotationView: NSView {
         finishTextEntry(commit: true)
         let field = NSTextField(frame: CGRect(x: point.x, y: point.y, width: min(280, max(80, bounds.width - point.x)), height: max(28, size(for: .text) + 12)))
         field.placeholderString = "输入文字"
-        field.font = .systemFont(ofSize: size(for: .text), weight: .semibold)
+        field.font = AppFonts.annotationFont(size: size(for: .text))
         field.textColor = color(for: .text); field.backgroundColor = NSColor.black.withAlphaComponent(0.72); field.drawsBackground = true
         field.isBordered = true; field.focusRingType = .default; field.target = self; field.action = #selector(commitTextEntry(_:))
         addSubview(field); textEditor = field; window?.makeFirstResponder(field)
@@ -249,10 +249,10 @@ final class AnnotationView: NSView {
         editingTextIndex = index
         selected = index
         textStyle = style
-        let textSize = text.size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold)])
+        let textSize = text.size(withAttributes: [.font: AppFonts.annotationFont(size: size)])
         let field = NSTextField(frame: CGRect(x: point.x, y: point.y, width: min(max(80, textSize.width + 28), max(80, bounds.width - point.x)), height: max(28, size + 12)))
         field.stringValue = text
-        field.font = .systemFont(ofSize: size, weight: .semibold)
+        field.font = AppFonts.annotationFont(size: size)
         field.textColor = color; field.backgroundColor = NSColor.black.withAlphaComponent(0.72); field.drawsBackground = true
         field.isBordered = true; field.focusRingType = .default; field.target = self; field.action = #selector(commitTextEntry(_:))
         addSubview(field); textEditor = field; window?.makeFirstResponder(field); needsDisplay = true
@@ -307,7 +307,7 @@ final class AnnotationView: NSView {
         case .path(let points, _, _): annotations[selected] = .path(points, color, size)
         case .text(let text, _, _, _, let style):
             let oldBounds = bounds(of: annotations[selected])
-            let measured = text.size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold)])
+            let measured = text.size(withAttributes: [.font: AppFonts.annotationFont(size: size)])
             annotations[selected] = .text(text, CGPoint(x: oldBounds.midX - measured.width / 2, y: oldBounds.midY - measured.height / 2), color, size, style)
         }
         needsDisplay = true
@@ -403,7 +403,7 @@ final class AnnotationView: NSView {
         }
     }
     private func drawText(_ text: String, at point: CGPoint, color: NSColor, size: CGFloat, style: AnnotationTextStyle) {
-        let font = NSFont.systemFont(ofSize: size, weight: .semibold)
+        let font = AppFonts.annotationFont(size: size)
         let outline = Self.focusedStroke(for: color)
         switch style {
         case .normal:
@@ -464,7 +464,7 @@ final class AnnotationView: NSView {
         undoStack.append(stateSnapshot); if undoStack.count > 20 { undoStack.removeFirst() }; redoStack.removeAll()
     }
     private func offset(_ item: Annotation, dx: CGFloat, dy: CGFloat) -> Annotation { switch item { case .line(let tool, let a, let b, let color, let width): .line(tool, CGPoint(x: a.x + dx, y: a.y + dy), CGPoint(x: b.x + dx, y: b.y + dy), color, width); case .path(let points, let color, let width): .path(points.map { CGPoint(x: $0.x + dx, y: $0.y + dy) }, color, width); case .text(let text, let point, let color, let size, let style): .text(text, CGPoint(x: point.x + dx, y: point.y + dy), color, size, style) } }
-    private func bounds(of item: Annotation) -> CGRect { switch item { case .line(let tool, let a, let b, _, let width): tool == .mosaic ? rect(a, b) : rect(a, b).insetBy(dx: -max(4, width), dy: -max(4, width)); case .path(let points, _, let width): points.reduce(CGRect.null) { $0.union(CGRect(origin: $1, size: .zero)) }.insetBy(dx: -max(4, width), dy: -max(4, width)); case .text(let text, let point, _, let size, _): CGRect(origin: point, size: text.size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold)])) } }
+    private func bounds(of item: Annotation) -> CGRect { switch item { case .line(let tool, let a, let b, _, let width): tool == .mosaic ? rect(a, b) : rect(a, b).insetBy(dx: -max(4, width), dy: -max(4, width)); case .path(let points, _, let width): points.reduce(CGRect.null) { $0.union(CGRect(origin: $1, size: .zero)) }.insetBy(dx: -max(4, width), dy: -max(4, width)); case .text(let text, let point, _, let size, _): CGRect(origin: point, size: text.size(withAttributes: [.font: AppFonts.annotationFont(size: size)])) } }
     private func endpoint(at point: CGPoint) -> LineEndpoint? {
         guard let selected, case .line(let tool, let start, let end, _, _) = annotations[selected], tool == .line || tool == .arrow else { return nil }
         if hypot(point.x - start.x, point.y - start.y) <= 10 { return .start }
@@ -496,6 +496,43 @@ enum PinZoom {
         guard delta != 0 else { return 1 }
         return pow(1.1, delta)
     }
+    static func percent(_ value: Double) -> String { "\(Int((value * 100).rounded()))%" }
+    static func voiceOverValue(_ value: Double) -> String { "当前 \(Int((value * 100).rounded())) 百分比" }
+    static func snapValue(_ value: Double, to target: Double, tolerance: Double = 0.1) -> Double? {
+        abs(value - target) <= tolerance ? target : nil
+    }
+}
+
+/// BRA-94 design-mandated slider visuals (sampled from the pin board, @2x: 46 px = 23 pt).
+enum PinSliderStyle {
+    static let trackHeight: CGFloat = 23
+    static let knobDiameter: CGFloat = 23
+    static let trackFillAlpha: CGFloat = 0.2
+    static let trackStrokeAlpha: CGFloat = 0.2
+    static let unityMarkAlpha: CGFloat = 0.5
+    static let knobRingHex = "#CCCCCC"
+}
+
+/// Borderless pin window that can become key so Cmd+W / Esc work (§8.7).
+private final class PinPanel: NSPanel {
+    var onCommandW: (() -> Void)?
+    var onCancel: (() -> Void)?
+
+    override var canBecomeKey: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "w" {
+            onCommandW?()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { onCancel?() } else { super.keyDown(with: event) }
+    }
+
+    override func cancelOperation(_ sender: Any?) { onCancel?() }
 }
 
 @MainActor
@@ -507,6 +544,8 @@ final class PinWindowController: NSWindowController {
     private let closeButton = NSButton()
     private let opacitySlider = PinSlider(value: 1, minValue: 0.2, maxValue: 1, target: nil, action: nil)
     private let zoomSlider = PinSlider(value: 1, minValue: Double(PinZoom.minScale), maxValue: Double(PinZoom.maxScale), target: nil, action: nil)
+    private let opacityValueLabel = NSTextField(labelWithString: "100%")
+    private let zoomValueLabel = NSTextField(labelWithString: "100%")
     private var scale: CGFloat
 
     static func show(_ image: NSImage) { let controller = PinWindowController(image: image); controllers.append(controller); controller.showWindow(nil) }
@@ -517,26 +556,30 @@ final class PinWindowController: NSWindowController {
         let visible = screen?.visibleFrame.size ?? NSSize(width: 800, height: 600)
         scale = PinZoom.initialScale(imageSize: image.size, visibleSize: visible)
         let imageArea = NSSize(width: max(1, image.size.width * scale), height: max(1, image.size.height * scale))
-        let window = NSPanel(contentRect: NSRect(origin: .zero, size: imageArea), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let window = PinPanel(contentRect: NSRect(origin: .zero, size: imageArea), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         imageView = PinImageView(image: image); imageView.imageScaling = .scaleProportionallyUpOrDown; imageView.imageAlignment = .alignCenter
         imageView.setAccessibilityLabel("贴图，置顶窗口")
         window.level = .floating; window.isMovableByWindowBackground = true; window.hasShadow = true; window.setAccessibilityLabel("贴图，置顶窗口")
         window.backgroundColor = .clear; window.isOpaque = false
         super.init(window: window)
+        window.onCommandW = { [weak self] in self?.closePin() }
+        window.onCancel = { [weak self] in self?.setControlsVisible(false) }
         imageView.onScrollZoom = { [weak self] delta, precise in self?.scrollZoom(delta, precise: precise) }
         let content = PinContainerView(frame: NSRect(origin: .zero, size: imageArea)); content.wantsLayer = true; content.layer?.cornerRadius = 8; content.layer?.masksToBounds = true
         content.onHoverChanged = { [weak self] visible in self?.setControlsVisible(visible) }
         window.contentView = content
         imageView.wantsLayer = true; content.addSubview(imageView)
         closeButton.image = Self.closeImage(); closeButton.imagePosition = .imageOnly; closeButton.isBordered = false; closeButton.target = self; closeButton.action = #selector(closePin); closeButton.setAccessibilityLabel("关闭"); closeButton.alphaValue = 0; content.addSubview(closeButton)
-        opacitySlider.target = self; opacitySlider.action = #selector(changeOpacity(_:)); opacitySlider.isContinuous = true; opacitySlider.setAccessibilityLabel("贴图透明度")
-        zoomSlider.target = self; zoomSlider.action = #selector(changeZoom(_:)); zoomSlider.isContinuous = true; zoomSlider.snapValue = 1; zoomSlider.setAccessibilityLabel("贴图缩放")
         opacitySlider.configureAppearance(unityMark: false)
         zoomSlider.configureAppearance(unityMark: true)
+        opacitySlider.target = self; opacitySlider.action = #selector(changeOpacity(_:)); opacitySlider.isContinuous = true; opacitySlider.setAccessibilityLabel("透明度"); opacitySlider.setAccessibilityValue(PinZoom.voiceOverValue(opacitySlider.doubleValue))
+        zoomSlider.target = self; zoomSlider.action = #selector(changeZoom(_:)); zoomSlider.isContinuous = true; zoomSlider.snapValue = 1; zoomSlider.setAccessibilityLabel("缩放"); zoomSlider.setAccessibilityValue(PinZoom.voiceOverValue(zoomSlider.doubleValue))
         controls.orientation = .vertical; controls.spacing = 8; controls.alphaValue = 0
-        controls.addArrangedSubview(Self.controlRow(label: "透明度", slider: opacitySlider))
-        controls.addArrangedSubview(Self.controlRow(label: "缩  放", slider: zoomSlider))
+        controls.addArrangedSubview(Self.controlRow(label: "透明度", slider: opacitySlider, valueLabel: opacityValueLabel))
+        controls.addArrangedSubview(Self.controlRow(label: "缩  放", slider: zoomSlider, valueLabel: zoomValueLabel))
         content.addSubview(controls)
+        zoomSlider.doubleValue = Double(scale)
+        zoomValueLabel.stringValue = PinZoom.percent(Double(scale))
         layout()
         if let screen { window.setFrameOrigin(CGPoint(x: screen.visibleFrame.midX - imageArea.width / 2, y: screen.visibleFrame.midY - imageArea.height / 2)) } else { window.center() }
     }
@@ -548,7 +591,7 @@ final class PinWindowController: NSWindowController {
         imageView.frame = content.bounds
         closeButton.frame = NSRect(x: max(0, size.width - 26), y: max(0, size.height - 28), width: 22, height: 22)
         let controlWidth = min(300, max(98, size.width - 60))
-        controls.frame = NSRect(x: (size.width - controlWidth) / 2, y: min(12, max(0, size.height - 32)), width: controlWidth, height: 32)
+        controls.frame = NSRect(x: (size.width - controlWidth) / 2, y: min(12, max(0, size.height - 60)), width: controlWidth, height: 60)
     }
 
     private func scrollZoom(_ delta: CGFloat, precise: Bool) {
@@ -568,10 +611,16 @@ final class PinWindowController: NSWindowController {
         window.setFrame(NSRect(x: frame.midX - imageArea.width / 2, y: frame.midY - imageArea.height / 2, width: imageArea.width, height: imageArea.height), display: true, animate: false)
         zoomSlider.maxValue = Double(maximum)
         zoomSlider.doubleValue = Double(scale)
+        zoomValueLabel.stringValue = PinZoom.percent(Double(scale))
+        zoomSlider.setAccessibilityValue(PinZoom.voiceOverValue(Double(scale)))
         layout()
     }
 
-    @objc private func changeOpacity(_ sender: NSSlider) { window?.alphaValue = sender.doubleValue }
+    @objc private func changeOpacity(_ sender: NSSlider) {
+        window?.alphaValue = sender.doubleValue
+        opacityValueLabel.stringValue = PinZoom.percent(sender.doubleValue)
+        sender.setAccessibilityValue(PinZoom.voiceOverValue(sender.doubleValue))
+    }
     @objc private func changeZoom(_ sender: NSSlider) { setScale(sender.doubleValue) }
     @objc private func closePin() { close() }
 
@@ -579,9 +628,11 @@ final class PinWindowController: NSWindowController {
         NSAnimationContext.runAnimationGroup { context in context.duration = 0.2; controls.animator().alphaValue = visible ? 1 : 0; closeButton.animator().alphaValue = visible ? 1 : 0 }
     }
 
-    private static func controlRow(label: String, slider: NSSlider) -> NSView {
+    private static func controlRow(label: String, slider: NSSlider, valueLabel: NSTextField) -> NSView {
         let text = NSTextField(labelWithString: label); text.font = .systemFont(ofSize: 10, weight: .bold); text.textColor = NSColor(hex: "#D9D9D9"); text.alignment = .center; text.widthAnchor.constraint(equalToConstant: 30).isActive = true
-        let row = NSStackView(views: [text, slider]); row.orientation = .horizontal; row.spacing = 6; row.alignment = .centerY; row.heightAnchor.constraint(equalToConstant: 12).isActive = true
+        valueLabel.font = .systemFont(ofSize: 10, weight: .bold); valueLabel.textColor = NSColor(hex: "#D9D9D9"); valueLabel.alignment = .left; valueLabel.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        let row = NSStackView(views: [text, slider, valueLabel]); row.orientation = .horizontal; row.spacing = 6; row.alignment = .centerY; row.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        slider.heightAnchor.constraint(equalToConstant: 24).isActive = true
         return row
     }
 
@@ -630,25 +681,51 @@ private final class PinSlider: NSSlider {
     }
     override func mouseDown(with event: NSEvent) {
         super.mouseDown(with: event)
-        if let snapValue, abs(doubleValue - snapValue) <= 0.1 { doubleValue = snapValue; sendAction(action, to: target) }
+        applySnapIfNeeded()
+    }
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        applySnapIfNeeded()
+    }
+    private func applySnapIfNeeded() {
+        guard let snapValue, let target = PinZoom.snapValue(doubleValue, to: snapValue) else { return }
+        doubleValue = target
+        sendAction(action, to: target)
     }
 }
 
 private final class PinSliderCell: NSSliderCell {
     var showsUnityMark = false
+    private func trackRect() -> NSRect {
+        guard let controlView else { return .zero }
+        return controlView.bounds.insetBy(dx: 1, dy: 0)
+    }
     override func drawBar(inside rect: NSRect, flipped: Bool) {
-        let track = NSRect(x: rect.minX + 1, y: rect.midY - 4, width: rect.width - 2, height: 8)
-        NSColor.black.withAlphaComponent(0.2).setFill(); NSBezierPath(roundedRect: track, xRadius: 4, yRadius: 4).fill()
-        NSColor.white.withAlphaComponent(0.2).setStroke(); let outline = NSBezierPath(roundedRect: track.insetBy(dx: 0.5, dy: 0.5), xRadius: 3.5, yRadius: 3.5); outline.lineWidth = 1; outline.stroke()
+        let height = PinSliderStyle.trackHeight
+        let track = NSRect(x: rect.minX + 1, y: rect.midY - height / 2, width: rect.width - 2, height: height)
+        let radius = track.height / 2
+        NSColor.black.withAlphaComponent(PinSliderStyle.trackFillAlpha).setFill(); NSBezierPath(roundedRect: track, xRadius: radius, yRadius: radius).fill()
+        NSColor.white.withAlphaComponent(PinSliderStyle.trackStrokeAlpha).setStroke(); let outline = NSBezierPath(roundedRect: track.insetBy(dx: 0.5, dy: 0.5), xRadius: radius - 0.5, yRadius: radius - 0.5); outline.lineWidth = 1; outline.stroke()
         if showsUnityMark, minValue < 1, maxValue > 1 {
             let x = track.minX + CGFloat((1 - minValue) / (maxValue - minValue)) * track.width
-            NSColor.white.withAlphaComponent(0.5).setStroke(); let marker = NSBezierPath(); marker.move(to: CGPoint(x: x, y: track.minY)); marker.line(to: CGPoint(x: x, y: track.maxY)); marker.lineWidth = 1; marker.stroke()
+            NSColor.white.withAlphaComponent(PinSliderStyle.unityMarkAlpha).setStroke(); let marker = NSBezierPath(); marker.move(to: CGPoint(x: x, y: track.minY)); marker.line(to: CGPoint(x: x, y: track.maxY)); marker.lineWidth = 1; marker.stroke()
         }
     }
+    override func knobRect(flipped: Bool) -> NSRect {
+        let bar = trackRect()
+        let t = maxValue > minValue ? CGFloat((doubleValue - minValue) / (maxValue - minValue)) : 0
+        let centerX = bar.minX + t * bar.width
+        let d = PinSliderStyle.knobDiameter
+        return NSRect(x: centerX - d / 2, y: bar.midY - d / 2, width: d, height: d)
+    }
     override func drawKnob(_ knobRect: NSRect) {
-        let knob = NSRect(x: knobRect.midX - 6, y: knobRect.midY - 6, width: 12, height: 12)
+        let d = PinSliderStyle.knobDiameter
+        let knob = NSRect(x: knobRect.midX - d / 2, y: knobRect.midY - d / 2, width: d, height: d)
+        let shadow = NSShadow(); shadow.shadowColor = NSColor.black.withAlphaComponent(0.3); shadow.shadowBlurRadius = 3; shadow.shadowOffset = NSSize(width: 0, height: -1)
+        NSGraphicsContext.saveGraphicsState(); shadow.set()
         NSColor.white.setFill(); NSBezierPath(ovalIn: knob).fill()
-        NSColor.black.withAlphaComponent(0.12).setStroke(); let ring = NSBezierPath(ovalIn: knob.insetBy(dx: 0.5, dy: 0.5)); ring.lineWidth = 1; ring.stroke()
+        NSGraphicsContext.restoreGraphicsState()
+        NSColor(hex: PinSliderStyle.knobRingHex)?.setStroke(); let ring = NSBezierPath(ovalIn: knob.insetBy(dx: 0.5, dy: 0.5)); ring.lineWidth = 1; ring.stroke()
     }
 }
 

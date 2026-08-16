@@ -11,7 +11,7 @@
 | FR-CAP-01/02/03 | `CaptureCoordinator.swift` display/window selection, shadow and physical pixels | release build; physics-pixel output-size tests | B+M |
 | FR-CAP-04/05 | `ResultWindow.swift` `AnnotationView` tools, selection/move/delete and 20-state history | release build; style persistence tests | B+M |
 | FR-CAP-06/07 | `ResultWindow.swift` flattened render, clipboard, PNG, share and pixelated mosaic | release build | M |
-| FR-CAP-08 | `PinWindowController` move/resize/opacity/close | release build | M |
+| FR-CAP-08 | `PinWindowController` move/resize/opacity/close; BRA-94: capsule slider (23 pt track/knob), live % readout (opacity/zoom), mouseUp 100% snap; BRA-98: `PinPanel` key-capable borderless `NSPanel`, Cmd+W closes window / Esc hides controls (§8.7, no file/result deletion) | `testPercentReadoutFormatsIntegerPercent`, `testSnapOnlyWithinTenPercentOfTarget`, `testSliderStyleMatchesDesignAnnotation`, `testZoomReadoutUpdatesInRealTimeOnWheelZoom`, `testOpacityReadoutUpdatesInRealTimeOnSliderChange`, `testPinPanelCanBecomeKey`, `testCommandWClosesWindowWithoutTouchingFileOrRecentResult`, `testEscapeHidesControlsButKeepsWindowOpen`, `testEscapeKeyDownHidesControlsButKeepsWindowOpen`, `testEscapeAfterHoverShowsThenHidesControls`; release build | B+M |
 | FR-CAP-09 | `CaptureCoordinator.swift` frozen full-screen selecting/editing/committed state; reused `AnnotationView` with point-sized preview and native-pixel output | `testRegionCaptureOnlyCommitsFromEditing`; release build | B+M |
 | FR-CAP-10 | region selection geometry ↔ frozen CGImage pixel space unified in `AnnotationView.cgPixelRect`/`clampedCrop` and `render()`; upright crop instead of `draw(in:from:)` coordinate guessing; mosaic samples CG pixel rect | `testRegionPixelRectMapsYUpSelectionToCGTopLeft`, `testRegionRenderIsNotFlippedOrMirrored`; release build | B+M |
 | FR-CAP-11/12 | fixed-size toolbar (`toolbarFixedSize`); color button opens floating `NSPanel` below toolbar with preset swatches + eyedropper that samples the frozen screen CGImage pixels (no overlay interception), anchored at cursor | release build; build passes; interaction is user-verified | B+M |
@@ -30,6 +30,7 @@
 | FR-REC-08 | copy/save/Finder plus close/app-quit unsaved confirmation | release build | M |
 | FR-REC-09 | 2 GB start, 1 GB warning, 500 MB stop, Recovery source | `testFrozenDiskAndLongCaptureThresholds` | B+M |
 | FR-REC-10 | AV device disconnect observer; microphone silence | release build; hot-unplug remains user validation | M |
+| BRA-107 (字体) | `Package.swift` 将 `font` 目录 `.process` 进 target resources；`AppFonts.register()`（`CTFontManagerRegisterFontsForURL`）启动注册内嵌 Alimama 字体；`AppFonts.annotationFont(size:)` 单一工厂替换 `ResultWindow.swift` 文字标注 6 处调用（编辑框/测量/绘制/命中 bounds 同一字体）；其余界面按设计矩阵保留系统/等宽字体，缺失字形 AppKit 逐字形回退 | `testAnnotationFontFactoryFallsBackToSystemFontWhenNotRegistered`、`testAnnotationFontFactoryResolvesAlimamaAfterRegistration`、`testBundledFontResourceIsPackaged`；release build；bundle/app 内含 `AlimamaFangYuanTiVF-Bold-sub.ttf` | B+M |
 
 后台自测闭环（本次 BRA-43 交付运行结果，见 `QA-BACKGROUND-TEST-LOOP.md`）：
 

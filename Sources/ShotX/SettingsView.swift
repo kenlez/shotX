@@ -105,6 +105,9 @@ private struct RecordingPane: View {
             Toggle("系统声音", isOn: toggle(\.systemAudio, permission: .systemAudio))
             Toggle("麦克风", isOn: toggle(\.microphone, permission: .microphone))
             Toggle("摄像头画面", isOn: toggle(\.cameraEnabled, permission: .camera))
+            Picker("摄像头尺寸", selection: plain(\.cameraSize)) { Text(CameraOverlaySize.small.displayName).tag(CameraOverlaySize.small); Text(CameraOverlaySize.large.displayName).tag(CameraOverlaySize.large) }.disabled(!model.settings.cameraEnabled)
+            Toggle("摄像头镜像", isOn: plain(\.cameraMirror)).disabled(!model.settings.cameraEnabled)
+            if CameraSession.supportsBackgroundBlur() { Toggle("摄像头模糊背景", isOn: plain(\.cameraBackgroundBlur)).disabled(!model.settings.cameraEnabled) }
             Picker("麦克风设备", selection: plain(\.selectedMicrophoneID)) { Text("系统默认").tag(""); ForEach(Self.audioDevices(), id: \.uniqueID) { Text($0.localizedName).tag($0.uniqueID) } }.disabled(!model.settings.microphone)
             Toggle("显示指针", isOn: plain(\.showsCursor))
             Toggle("显示点击反馈", isOn: plain(\.showsClicks))
