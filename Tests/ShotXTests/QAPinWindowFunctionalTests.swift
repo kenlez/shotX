@@ -28,9 +28,7 @@ final class QAPinWindowFunctionalTests: XCTestCase {
 
     private func fireScroll(_ view: PinImageView, deltaY: CGFloat, precise: Bool) {
         view.onScrollZoom?(deltaY, precise)
-    }
-
-    /// Observed scale, derived from window width (image area = width - 2*insets).
+    }    /// Observed scale, derived from window width (image area = width - 2*insets).
     private func observedScale(of controller: PinWindowController, imageWidth: CGFloat) -> CGFloat {
         let w = controller.window!.frame.width
         return w / imageWidth
@@ -121,6 +119,32 @@ final class QAPinWindowFunctionalTests: XCTestCase {
         XCTAssertEqual(window.frame.origin.y, origin.y + 30, accuracy: 0.01, "window must move +30 Y")
     }
 
+    // ── Acceptance point 3: live percent readout tracks slider/scroll ──
+    func testZoomReadoutUpdatesInRealTimeOnWheelZoom() throws {
+        let controller = makeWindow(imageSize: NSSize(width: 200, height: 100)).controller
+        let iv = imageView(of: controller)
+
+        fireScroll(iv, deltaY: 5, precise: false)
+
+        let expectedScale = PinZoom.clamp(1 * PinZoom.zoomFactor(deltaY: 5, precise: false))
+        let zoomSlider = controller.window!.contentView!.allSubviews().compactMap { $0 as? NSSlider }.last!
+        XCTAssertEqual(zoomSlider.accessibilityValue() as? String, PinZoom.voiceOverValue(Double(expectedScale)),
+                       "zoom readout must reflect wheel zoom in real time")
+        XCTAssertEqual(zoomSlider.doubleValue, Double(expectedScale), accuracy: 0.01)
+    }
+
+    func testOpacityReadoutUpdatesInRealTimeOnSliderChange() throws {
+        let controller = makeWindow(imageSize: NSSize(width: 200, height: 100)).controller
+        let sliders = controller.window!.contentView!.allSubviews().compactMap { $0 as? NSSlider }
+        let opacitySlider = sliders.first { $0.accessibilityLabel() == "透明度" } ?? sliders[0]
+
+        opacitySlider.doubleValue = 0.5
+        opacitySlider.sendAction(opacitySlider.action, to: opacitySlider.target)
+
+        XCTAssertEqual(opacitySlider.accessibilityValue() as? String, PinZoom.voiceOverValue(0.5))
+        XCTAssertEqual(controller.window?.alphaValue ?? 1, 0.5, accuracy: 0.001)
+    }
+
     func testCloseDoesNotTouchClipboard() throws {
         let controller = PinWindowController(image: NSImage(size: NSSize(width: 40, height: 30)))
         guard let content = controller.window?.contentView else { return XCTFail("content missing") }
@@ -133,5 +157,16 @@ final class QAPinWindowFunctionalTests: XCTestCase {
         XCTAssertTrue(NSPasteboard.general.readObjects(forClasses: [NSImage.self], options: nil)?.isEmpty ?? true,
                       "关闭 must not write to clipboard")
         XCTAssertFalse(controller.window?.isVisible ?? false, "关闭 must close the window")
+    }
+}
+
+private extension NSView {
+    func allSubviews() -> [NSView] {
+        var result: [NSView] = []
+        for sub in subviews {
+            result.append(sub)
+            result.append(contentsOf: sub.allSubviews())
+        }
+        return result
     }
 }
