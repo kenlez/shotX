@@ -158,6 +158,86 @@ final class QAPinWindowFunctionalTests: XCTestCase {
                       "关闭 must not write to clipboard")
         XCTAssertFalse(controller.window?.isVisible ?? false, "关闭 must close the window")
     }
+
+    // ── §8.7 keyboard paths: Cmd+W closes, Esc hides controls ──
+    private func makeCommandWEvent(window: NSWindow) -> NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command], timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "w", charactersIgnoringModifiers: "w", isARepeat: false, keyCode: 13)!
+    }
+
+    private func makeEscapeEvent(window: NSWindow) -> NSEvent {
+        NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "\u{1B}", charactersIgnoringModifiers: "\u{1B}", isARepeat: false, keyCode: 53)!
+    }
+
+    private func controlsStack(in content: NSView) -> NSStackView? {
+        content.subviews.compactMap { $0 as? NSStackView }.first { $0.orientation == .vertical }
+    }
+
+    func testPinPanelCanBecomeKey() throws {
+        let (_, window) = makeWindow(imageSize: NSSize(width: 200, height: 100))
+        XCTAssertTrue(window.canBecomeKey, "pin window must be able to become key to receive keyboard events")
+    }
+
+    func testCommandWClosesWindowWithoutTouchingFileOrRecentResult() throws {
+        let (controller, window) = makeWindow(imageSize: NSSize(width: 200, height: 100))
+        controller.showWindow(nil)
+        XCTAssertTrue(window.isVisible, "precondition: pin window visible")
+
+        NSPasteboard.general.clearContents()
+        let handled = window.performKeyEquivalent(with: makeCommandWEvent(window: window))
+
+        XCTAssertTrue(handled, "Cmd+W must be consumed by the pin window")
+        XCTAssertFalse(window.isVisible, "Cmd+W must close the pin window")
+        XCTAssertTrue(NSPasteboard.general.readObjects(forClasses: [NSImage.self], options: nil)?.isEmpty ?? true,
+                      "Cmd+W must not write to clipboard")
+    }
+
+    func testEscapeHidesControlsButKeepsWindowOpen() throws {
+        let (controller, window) = makeWindow(imageSize: NSSize(width: 200, height: 100))
+        controller.showWindow(nil)
+        guard let content = window.contentView else { return XCTFail("content missing") }
+        guard let controls = controlsStack(in: content) else { return XCTFail("controls stack missing") }
+        let closeButton = content.subviews.compactMap { $0 as? NSButton }.first { $0.accessibilityLabel() == "关闭" }
+        guard let closeButton else { return XCTFail("关闭 button missing") }
+
+        window.cancelOperation(nil)
+
+        XCTAssertTrue(window.isVisible, "Esc must not close the pin window")
+        XCTAssertEqual(closeButton.alphaValue, 0, accuracy: 0.01, "Esc must hide the close button")
+        XCTAssertEqual(controls.alphaValue, 0, accuracy: 0.01, "Esc must hide the control bars")
+    }
+
+    func testEscapeKeyDownHidesControlsButKeepsWindowOpen() throws {
+        let (controller, window) = makeWindow(imageSize: NSSize(width: 200, height: 100))
+        controller.showWindow(nil)
+        guard let content = window.contentView else { return XCTFail("content missing") }
+        guard let controls = controlsStack(in: content) else { return XCTFail("controls stack missing") }
+        let closeButton = content.subviews.compactMap { $0 as? NSButton }.first { $0.accessibilityLabel() == "关闭" }
+        guard let closeButton else { return XCTFail("关闭 button missing") }
+
+        window.keyDown(with: makeEscapeEvent(window: window))
+
+        XCTAssertTrue(window.isVisible, "Esc keyDown must not close the pin window")
+        XCTAssertEqual(closeButton.alphaValue, 0, accuracy: 0.01, "Esc keyDown must hide the close button")
+        XCTAssertEqual(controls.alphaValue, 0, accuracy: 0.01, "Esc keyDown must hide the control bars")
+    }
+
+    func testEscapeAfterHoverShowsThenHidesControls() throws {
+        let (controller, window) = makeWindow(imageSize: NSSize(width: 200, height: 100))
+        controller.showWindow(nil)
+        guard let content = window.contentView else { return XCTFail("content missing") }
+        guard let controls = controlsStack(in: content) else { return XCTFail("controls stack missing") }
+
+        let enter = NSEvent.enterExitEvent(with: .mouseEntered, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil)!
+        content.mouseEntered(with: enter)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        XCTAssertEqual(controls.alphaValue, 1, accuracy: 0.01, "hover must reveal the control bars")
+
+        window.cancelOperation(nil)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+
+        XCTAssertTrue(window.isVisible, "Esc after hover must not close the pin window")
+        XCTAssertEqual(controls.alphaValue, 0, accuracy: 0.01, "Esc after hover must hide the control bars again")
+    }
 }
 
 private extension NSView {

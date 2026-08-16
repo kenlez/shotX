@@ -513,6 +513,28 @@ enum PinSliderStyle {
     static let knobRingHex = "#CCCCCC"
 }
 
+/// Borderless pin window that can become key so Cmd+W / Esc work (§8.7).
+private final class PinPanel: NSPanel {
+    var onCommandW: (() -> Void)?
+    var onCancel: (() -> Void)?
+
+    override var canBecomeKey: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "w" {
+            onCommandW?()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 { onCancel?() } else { super.keyDown(with: event) }
+    }
+
+    override func cancelOperation(_ sender: Any?) { onCancel?() }
+}
+
 @MainActor
 final class PinWindowController: NSWindowController {
     private static var controllers: [PinWindowController] = []
@@ -534,12 +556,14 @@ final class PinWindowController: NSWindowController {
         let visible = screen?.visibleFrame.size ?? NSSize(width: 800, height: 600)
         scale = PinZoom.initialScale(imageSize: image.size, visibleSize: visible)
         let imageArea = NSSize(width: max(1, image.size.width * scale), height: max(1, image.size.height * scale))
-        let window = NSPanel(contentRect: NSRect(origin: .zero, size: imageArea), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let window = PinPanel(contentRect: NSRect(origin: .zero, size: imageArea), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         imageView = PinImageView(image: image); imageView.imageScaling = .scaleProportionallyUpOrDown; imageView.imageAlignment = .alignCenter
         imageView.setAccessibilityLabel("贴图，置顶窗口")
         window.level = .floating; window.isMovableByWindowBackground = true; window.hasShadow = true; window.setAccessibilityLabel("贴图，置顶窗口")
         window.backgroundColor = .clear; window.isOpaque = false
         super.init(window: window)
+        window.onCommandW = { [weak self] in self?.closePin() }
+        window.onCancel = { [weak self] in self?.setControlsVisible(false) }
         imageView.onScrollZoom = { [weak self] delta, precise in self?.scrollZoom(delta, precise: precise) }
         let content = PinContainerView(frame: NSRect(origin: .zero, size: imageArea)); content.wantsLayer = true; content.layer?.cornerRadius = 8; content.layer?.masksToBounds = true
         content.onHoverChanged = { [weak self] visible in self?.setControlsVisible(visible) }
