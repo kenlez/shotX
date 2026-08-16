@@ -237,7 +237,7 @@ final class AnnotationView: NSView {
         finishTextEntry(commit: true)
         let field = NSTextField(frame: CGRect(x: point.x, y: point.y, width: min(280, max(80, bounds.width - point.x)), height: max(28, size(for: .text) + 12)))
         field.placeholderString = "输入文字"
-        field.font = .systemFont(ofSize: size(for: .text), weight: .semibold)
+        field.font = AppFonts.annotationFont(size: size(for: .text))
         field.textColor = color(for: .text); field.backgroundColor = NSColor.black.withAlphaComponent(0.72); field.drawsBackground = true
         field.isBordered = true; field.focusRingType = .default; field.target = self; field.action = #selector(commitTextEntry(_:))
         addSubview(field); textEditor = field; window?.makeFirstResponder(field)
@@ -249,10 +249,10 @@ final class AnnotationView: NSView {
         editingTextIndex = index
         selected = index
         textStyle = style
-        let textSize = text.size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold)])
+        let textSize = text.size(withAttributes: [.font: AppFonts.annotationFont(size: size)])
         let field = NSTextField(frame: CGRect(x: point.x, y: point.y, width: min(max(80, textSize.width + 28), max(80, bounds.width - point.x)), height: max(28, size + 12)))
         field.stringValue = text
-        field.font = .systemFont(ofSize: size, weight: .semibold)
+        field.font = AppFonts.annotationFont(size: size)
         field.textColor = color; field.backgroundColor = NSColor.black.withAlphaComponent(0.72); field.drawsBackground = true
         field.isBordered = true; field.focusRingType = .default; field.target = self; field.action = #selector(commitTextEntry(_:))
         addSubview(field); textEditor = field; window?.makeFirstResponder(field); needsDisplay = true
@@ -307,7 +307,7 @@ final class AnnotationView: NSView {
         case .path(let points, _, _): annotations[selected] = .path(points, color, size)
         case .text(let text, _, _, _, let style):
             let oldBounds = bounds(of: annotations[selected])
-            let measured = text.size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold)])
+            let measured = text.size(withAttributes: [.font: AppFonts.annotationFont(size: size)])
             annotations[selected] = .text(text, CGPoint(x: oldBounds.midX - measured.width / 2, y: oldBounds.midY - measured.height / 2), color, size, style)
         }
         needsDisplay = true
@@ -403,7 +403,7 @@ final class AnnotationView: NSView {
         }
     }
     private func drawText(_ text: String, at point: CGPoint, color: NSColor, size: CGFloat, style: AnnotationTextStyle) {
-        let font = NSFont.systemFont(ofSize: size, weight: .semibold)
+        let font = AppFonts.annotationFont(size: size)
         let outline = Self.focusedStroke(for: color)
         switch style {
         case .normal:
@@ -464,7 +464,7 @@ final class AnnotationView: NSView {
         undoStack.append(stateSnapshot); if undoStack.count > 20 { undoStack.removeFirst() }; redoStack.removeAll()
     }
     private func offset(_ item: Annotation, dx: CGFloat, dy: CGFloat) -> Annotation { switch item { case .line(let tool, let a, let b, let color, let width): .line(tool, CGPoint(x: a.x + dx, y: a.y + dy), CGPoint(x: b.x + dx, y: b.y + dy), color, width); case .path(let points, let color, let width): .path(points.map { CGPoint(x: $0.x + dx, y: $0.y + dy) }, color, width); case .text(let text, let point, let color, let size, let style): .text(text, CGPoint(x: point.x + dx, y: point.y + dy), color, size, style) } }
-    private func bounds(of item: Annotation) -> CGRect { switch item { case .line(let tool, let a, let b, _, let width): tool == .mosaic ? rect(a, b) : rect(a, b).insetBy(dx: -max(4, width), dy: -max(4, width)); case .path(let points, _, let width): points.reduce(CGRect.null) { $0.union(CGRect(origin: $1, size: .zero)) }.insetBy(dx: -max(4, width), dy: -max(4, width)); case .text(let text, let point, _, let size, _): CGRect(origin: point, size: text.size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold)])) } }
+    private func bounds(of item: Annotation) -> CGRect { switch item { case .line(let tool, let a, let b, _, let width): tool == .mosaic ? rect(a, b) : rect(a, b).insetBy(dx: -max(4, width), dy: -max(4, width)); case .path(let points, _, let width): points.reduce(CGRect.null) { $0.union(CGRect(origin: $1, size: .zero)) }.insetBy(dx: -max(4, width), dy: -max(4, width)); case .text(let text, let point, _, let size, _): CGRect(origin: point, size: text.size(withAttributes: [.font: AppFonts.annotationFont(size: size)])) } }
     private func endpoint(at point: CGPoint) -> LineEndpoint? {
         guard let selected, case .line(let tool, let start, let end, _, _) = annotations[selected], tool == .line || tool == .arrow else { return nil }
         if hypot(point.x - start.x, point.y - start.y) <= 10 { return .start }

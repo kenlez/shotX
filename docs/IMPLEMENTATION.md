@@ -30,6 +30,7 @@
 | FR-REC-08 | copy/save/Finder plus close/app-quit unsaved confirmation | release build | M |
 | FR-REC-09 | 2 GB start, 1 GB warning, 500 MB stop, Recovery source | `testFrozenDiskAndLongCaptureThresholds` | B+M |
 | FR-REC-10 | AV device disconnect observer; microphone silence | release build; hot-unplug remains user validation | M |
+| BRA-107 (字体) | `Package.swift` 将 `font` 目录 `.process` 进 target resources；`AppFonts.register()`（`CTFontManagerRegisterFontsForURL`）启动注册内嵌 Alimama 字体；`AppFonts.annotationFont(size:)` 单一工厂替换 `ResultWindow.swift` 文字标注 6 处调用（编辑框/测量/绘制/命中 bounds 同一字体）；其余界面按设计矩阵保留系统/等宽字体，缺失字形 AppKit 逐字形回退 | `testAnnotationFontFactoryFallsBackToSystemFontWhenNotRegistered`、`testAnnotationFontFactoryResolvesAlimamaAfterRegistration`、`testBundledFontResourceIsPackaged`；release build；bundle/app 内含 `AlimamaFangYuanTiVF-Bold-sub.ttf` | B+M |
 
 后台自测闭环（本次 BRA-43 交付运行结果，见 `QA-BACKGROUND-TEST-LOOP.md`）：
 
