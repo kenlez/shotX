@@ -225,10 +225,10 @@ final class AnnotationView: NSView {
         } else if tool == .text {
             beginTextEntry(at: start)
         } else if tool == .crop { remember(); cropRect = rect(start, end).intersection(bounds) }
-        else if tool == .pen { remember(); annotations.append(.path(draftPath.count > 1 ? draftPath : [start, end], color(for: tool), size(for: tool))) }
+        else if tool == .pen { remember(); annotations.append(.path(draftPath.count > 1 ? draftPath : [start, end], color(for: tool), size(for: tool))); selected = annotations.count - 1 }
         else {
             remember(); annotations.append(.line(tool, start, end, color(for: tool), size(for: tool)))
-            if tool == .line || tool == .arrow { selected = annotations.count - 1 }
+            selected = annotations.count - 1
         }
         moving = false
     }
@@ -547,6 +547,7 @@ final class PinWindowController: NSWindowController {
     private let opacityValueLabel = NSTextField(labelWithString: "100%")
     private let zoomValueLabel = NSTextField(labelWithString: "100%")
     private var scale: CGFloat
+    private var zoomRangeVisible: NSSize = .zero
 
     static func show(_ image: NSImage) { let controller = PinWindowController(image: image); controllers.append(controller); controller.showWindow(nil) }
 
@@ -578,6 +579,7 @@ final class PinWindowController: NSWindowController {
         controls.addArrangedSubview(Self.controlRow(label: "透明度", slider: opacitySlider, valueLabel: opacityValueLabel))
         controls.addArrangedSubview(Self.controlRow(label: "缩  放", slider: zoomSlider, valueLabel: zoomValueLabel))
         content.addSubview(controls)
+        applyZoomSliderRange(for: visible)
         zoomSlider.doubleValue = Double(scale)
         zoomValueLabel.stringValue = PinZoom.percent(Double(scale))
         layout()
@@ -598,18 +600,31 @@ final class PinWindowController: NSWindowController {
         setScale(scale * PinZoom.zoomFactor(deltaY: delta, precise: precise))
     }
 
+    private func zoomBounds(for visible: NSSize) -> (minimum: CGFloat, maximum: CGFloat) {
+        let minimum = max(PinZoom.minScale, 100 / max(1, baseImage.size.width), 100 / max(1, baseImage.size.height))
+        let maximum = min(PinZoom.maxScale, visible.width / max(1, baseImage.size.width), visible.height / max(1, baseImage.size.height))
+        return (minimum, maximum)
+    }
+
+    private func applyZoomSliderRange(for visible: NSSize) {
+        guard visible != zoomRangeVisible else { return }
+        zoomRangeVisible = visible
+        let bounds = zoomBounds(for: visible)
+        zoomSlider.minValue = Double(bounds.minimum)
+        zoomSlider.maxValue = Double(bounds.maximum)
+    }
+
     private func setScale(_ proposed: CGFloat) {
         guard let window else { return }
         let visible = window.screen?.visibleFrame.size ?? NSScreen.main?.visibleFrame.size ?? NSSize(width: 800, height: 600)
-        let minimum = max(PinZoom.minScale, 100 / max(1, baseImage.size.width), 100 / max(1, baseImage.size.height))
-        let maximum = min(PinZoom.maxScale, visible.width / max(1, baseImage.size.width), visible.height / max(1, baseImage.size.height))
-        let next = min(maximum, max(min(minimum, maximum), proposed))
+        applyZoomSliderRange(for: visible)
+        let bounds = zoomBounds(for: visible)
+        let next = min(bounds.maximum, max(min(bounds.minimum, bounds.maximum), proposed))
         guard next != scale else { return }
         scale = next
         let imageArea = NSSize(width: max(1, baseImage.size.width * scale), height: max(1, baseImage.size.height * scale))
         let frame = window.frame
         window.setFrame(NSRect(x: frame.midX - imageArea.width / 2, y: frame.midY - imageArea.height / 2, width: imageArea.width, height: imageArea.height), display: true, animate: false)
-        zoomSlider.maxValue = Double(maximum)
         zoomSlider.doubleValue = Double(scale)
         zoomValueLabel.stringValue = PinZoom.percent(Double(scale))
         zoomSlider.setAccessibilityValue(PinZoom.voiceOverValue(Double(scale)))
@@ -646,23 +661,11 @@ final class PinWindowController: NSWindowController {
 
 private final class PinContainerView: NSView {
     var onHoverChanged: ((Bool) -> Void)?
-    private let border = CAShapeLayer()
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        border.fillColor = NSColor.clear.cgColor
-        border.strokeColor = NSColor.black.withAlphaComponent(0.2).cgColor
-        border.lineWidth = 1
-        border.zPosition = 1000
-        layer?.addSublayer(border)
     }
     required init?(coder: NSCoder) { fatalError() }
-    override func layout() {
-        super.layout()
-        border.frame = bounds
-        border.contentsScale = window?.backingScaleFactor ?? 2
-        border.path = CGPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), cornerWidth: 7.5, cornerHeight: 7.5, transform: nil)
-    }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea)
