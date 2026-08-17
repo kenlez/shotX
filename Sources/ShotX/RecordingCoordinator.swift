@@ -269,28 +269,37 @@ final class RecordingCoordinator: NSObject {
     }
 
     /// 摄像头开启/关闭（BRA102-03）：开启即按需申请权限并启动会话，无需等录制开始。
+    /// BRA-116：权限未就绪时先不落定 `cameraEnabled`（避免假开启态），授权回调后再启用并启动会话。
     private func setCamera(_ enabled: Bool) {
         guard let model else { return }
-        model.settings.cameraEnabled = enabled
-        if enabled {
-            switch model.permissions[.camera] {
-            case .allowed: startCameraSession()
-            case .notDetermined:
-                model.request(.camera)
-                // 授权回调刷新权限后由 cameraPermissionChanged 启动会话。
-            default:
-                model.settings.cameraEnabled = false
-                model.showError("摄像头不可用。你仍可继续无摄像头录制。")
-            }
-        } else {
+        if !enabled {
+            model.setCameraEnableIntent(false)
+            model.settings.cameraEnabled = false
             stopCameraSession()
+            return
+        }
+        switch model.permissions[.camera] {
+        case .allowed:
+            model.settings.cameraEnabled = true
+            startCameraSession()
+        case .notDetermined:
+            // 授权回调刷新权限后由 cameraPermissionChanged 落定开关并启动会话。
+            model.setCameraEnableIntent(true)
+            model.request(.camera)
+        default:
+            model.settings.cameraEnabled = false
+            model.showError("摄像头不可用。你仍可继续无摄像头录制。")
         }
     }
 
     /// 摄像头权限状态变化（授权回调刷新后），权限就绪且开关仍开启时启动会话。
+    /// BRA-116：`setCamera` 不再预置开关，授权后在此落定 `cameraEnabled` 并启动会话。
     private func cameraPermissionChanged(_ state: PermissionState?) {
-        guard state == .allowed, model?.settings.cameraEnabled == true else { return }
-        startCameraSession()
+        guard let model else { return }
+        guard state == .allowed else { return }
+        if model.settings.cameraEnabled, model.permissions[.camera] == .allowed {
+            startCameraSession()
+        }
     }
 
     /// 打开设置面板/权限就绪后调用：若开关开启且已授权则启动会话 + 显示预览。
@@ -338,6 +347,7 @@ final class RecordingCoordinator: NSObject {
         cameraPreview?.close()
         cameraPreview = nil
         geometry?.cameraHint = nil
+        status?.setSourceLost(.camera)
         model?.showError("摄像头已断开，其他来源仍在录制。")
     }
 
@@ -401,17 +411,16 @@ final class RecordingCoordinator: NSObject {
         overlay?.close()
         overlay = RecordingRegionOverlayController(screen: pending.screen, selection: locked)
         var settings = model.settings
-        if settings.microphone && model.permissions[.microphone] != .allowed {
+        if settings.microphone && (model.permissions[.microphone] != .allowed || !RecordingDeviceAvailability.hasMicrophoneDevice()) {
             settings.microphone = false
             model.showError("麦克风不可用。你仍可继续无麦克风录制。")
         }
-        if settings.cameraEnabled && model.permissions[.camera] != .allowed {
+        if settings.cameraEnabled && (model.permissions[.camera] != .allowed || !RecordingDeviceAvailability.hasCameraDevice()) {
             settings.cameraEnabled = false
             model.showError("摄像头不可用。你仍可继续无摄像头录制。")
         }
         let delay = settings.countdown
-        let sources = [settings.systemAudio ? "系统声" : nil, settings.microphone ? "麦克风" : nil, settings.cameraEnabled ? "摄像头" : nil].compactMap { $0 }.joined(separator: "+")
-        status = RecordingStatusWindowController(screen: pending.screen, selection: locked, sources: sources.isEmpty ? "静音" : sources, onStop: { [weak self] in self?.cancelCountdown() })
+        status = RecordingStatusWindowController(screen: pending.screen, selection: locked, settings: settings, onStop: { [weak self] in self?.cancelCountdown() })
         overlay?.show(state: .countdown(delay))
         status?.showCountdown(delay)
         installEscapeMonitor { [weak self] in self?.cancelCountdown() }
@@ -449,6 +458,8 @@ final class RecordingCoordinator: NSObject {
             let url = try RecoveryStore.newURL()
             let recorder = try ScreenRecorder(url: url, filter: filter, screenFrame: screen.frame, sourceRect: source, width: Int(output.width), height: Int(output.height), settings: settings, cameraFeed: cameraSession, onNotice: { [weak model] message in
                 Task { @MainActor in model?.showError(message) }
+            }, onMicrophoneLost: { [weak self] in
+                Task { @MainActor in self?.status?.setSourceLost(.microphone) }
             }) { [weak self] result in
                 Task { @MainActor in self?.finished(result) }
             }
@@ -593,8 +604,9 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
     private let writer: AVAssetWriter
     private let video: AVAssetWriterInput
     private let videoAdaptor: AVAssetWriterInputPixelBufferAdaptor
-    private let systemAudio: AVAssetWriterInput?
-    private let microphone: AVAssetWriterInput?
+    private let audio: AVAssetWriterInput?
+    private let mixer: RecordingAudioMixer?
+    private var pendingAudio: [CMSampleBuffer] = []
     private let stream: SCStream
     private let queue = DispatchQueue(label: "ShotX.recording")
     private let completion: (Result<URL, Error>) -> Void
@@ -617,12 +629,14 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
     private let cameraScale: CGFloat
     private var disconnectObserver: NSObjectProtocol?
     private let onNotice: (String) -> Void
+    private let onMicrophoneLost: () -> Void
     private var warnedDisk = false
 
-    init(url: URL, filter: SCContentFilter, screenFrame: CGRect, sourceRect: CGRect, width: Int, height: Int, settings: AppSettings, cameraFeed: CameraSession?, onNotice: @escaping (String) -> Void, completion: @escaping (Result<URL, Error>) -> Void) throws {
+    init(url: URL, filter: SCContentFilter, screenFrame: CGRect, sourceRect: CGRect, width: Int, height: Int, settings: AppSettings, cameraFeed: CameraSession?, onNotice: @escaping (String) -> Void, onMicrophoneLost: @escaping () -> Void = {}, completion: @escaping (Result<URL, Error>) -> Void) throws {
         self.url = url
         self.completion = completion
         self.onNotice = onNotice
+        self.onMicrophoneLost = onMicrophoneLost
         self.cameraFeed = cameraFeed
         cameraSize = settings.cameraSize
         cameraMirror = settings.cameraMirror
@@ -653,8 +667,18 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
             writer.add(input)
             return input
         }
-        systemAudio = settings.systemAudio ? audioInput(writer) : nil
-        microphone = settings.microphone ? audioInput(writer) : nil
+        let wantsAudio = settings.systemAudio || settings.microphone
+        if wantsAudio {
+            let input = audioInput(writer)
+            let mixer = RecordingAudioMixer()
+            // 麦克风会话尚未创建；此处先按系统声音配置，makeSourceSession 后再据设备是否可用刷新。
+            mixer.configure(system: settings.systemAudio, microphoneConfigured: false)
+            self.audio = input
+            self.mixer = mixer
+        } else {
+            self.audio = nil
+            self.mixer = nil
+        }
 
         let config = SCStreamConfiguration()
         config.sourceRect = sourceRect
@@ -673,10 +697,17 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         if settings.systemAudio { try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue) }
         if settings.microphone { sourceSession = try makeSourceSession(settings: settings) }
+        // 麦克风会话是否真实存在（有输入输出）决定混音器是否等它；无设备则当作未启用，不阻塞系统声音。
+        mixer?.configure(system: settings.systemAudio, microphoneConfigured: settings.microphone && microphoneOutput != nil)
         disconnectObserver = NotificationCenter.default.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: nil, queue: nil) { [weak self] notification in
             guard let self, let device = notification.object as? AVCaptureDevice else { return }
             self.queue.async {
-                if device.hasMediaType(.audio) { self.onNotice("麦克风已断开，录屏将继续并从断开点静音。") }
+                if device.hasMediaType(.audio) {
+                    self.mixer?.finishMicrophone()
+                    self.flushAudio()
+                    self.onMicrophoneLost()
+                    self.onNotice("麦克风已断开，录屏将继续并从断开点静音。")
+                }
             }
         }
     }
@@ -696,16 +727,21 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
     }
 
     func stop() async {
-        guard !finishing else { return }
-        finishing = true
+        // 与回调同队列同步置位 finishing：已入队的回调先跑完（正常 append），之后的新回调因 finishing 短路。
+        queue.sync { if !finishing { finishing = true } }
         try? await stream.stopCapture()
         diskTimer?.cancel()
         sourceSession?.stopRunning()
         if let disconnectObserver { NotificationCenter.default.removeObserver(disconnectObserver) }
         if let clickMonitor { NSEvent.removeMonitor(clickMonitor) }
         video.markAsFinished()
-        systemAudio?.markAsFinished()
-        microphone?.markAsFinished()
+        // 在串行队列上结束两路音频源并冲刷剩余混音，避免与回调并发读写 pendingAudio/mixer。
+        queue.sync {
+            mixer?.finishSystem()
+            mixer?.finishMicrophone()
+            flushAudio()
+        }
+        audio?.markAsFinished()
         await writer.finishWriting()
         completion(writer.status == .completed ? .success(url) : .failure(writer.error ?? CocoaError(.fileWriteUnknown)))
     }
@@ -717,10 +753,23 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
         if !started {
             guard type == .screen else { return }
             writer.startSession(atSourceTime: sampleBuffer.presentationTimeStamp)
+            mixer?.setAnchor(sampleBuffer.presentationTimeStamp)
             started = true
         }
         if type == .screen, video.isReadyForMoreMediaData { appendVideo(sampleBuffer) }
-        else if type == .audio, let systemAudio, systemAudio.isReadyForMoreMediaData { systemAudio.append(sampleBuffer) }
+        else if type == .audio {
+            mixer?.appendSystem(sampleBuffer)
+            flushAudio()
+        }
+    }
+
+    /// 从混音器取出混合后的 PCM 缓冲并写入单一音频输入；输入未就绪时先暂存，待下一回调续写。
+    private func flushAudio() {
+        guard let audio else { return }
+        if let mixer { pendingAudio.append(contentsOf: mixer.drain()) }
+        while !pendingAudio.isEmpty, audio.isReadyForMoreMediaData {
+            audio.append(pendingAudio.removeFirst())
+        }
     }
 
     private func appendVideo(_ sample: CMSampleBuffer) {
@@ -775,7 +824,9 @@ private final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, 
 
 extension ScreenRecorder: AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        if output === microphoneOutput, started, let microphone, microphone.isReadyForMoreMediaData { microphone.append(sampleBuffer) }
+        guard output === microphoneOutput, started else { return }
+        mixer?.appendMicrophone(sampleBuffer)
+        flushAudio()
     }
 }
 
@@ -891,6 +942,7 @@ private struct RecordingSetupView: View {
     let onCameraChanged: (Bool) -> Void
     let onCameraPermissionChanged: (PermissionState?) -> Void
     let onCameraSettingsChanged: () -> Void
+    @FocusState private var speakerFocused: Bool
 
     var body: some View {
         VStack(spacing: 16) {
@@ -900,10 +952,11 @@ private struct RecordingSetupView: View {
                 .keyboardShortcut(.defaultAction)
                 .frame(width: 208, height: 40)
                 .buttonStyle(.plain)
-            Rectangle().fill(Color.white.opacity(0.32)).frame(width: 208, height: 1)
+            Rectangle().fill(Color(red: 217/255, green: 217/255, blue: 217/255).opacity(0.6)).frame(width: 208, height: 1)
             HStack(spacing: 16) {
-                recordToggle("record-speaker", menu: false, isOn: plain(\.systemAudio))
-                recordToggle("record-microphone", isOn: binding(\.microphone, permission: .microphone))
+                sourceButton("record-speaker", isOn: speakerOn, pending: false, label: "扬声器", value: speakerOn ? "已开启" : "已关闭", action: toggleSpeaker)
+                    .focused($speakerFocused)
+                sourceButton("record-microphone", isOn: microphoneOn, pending: model.requesting == .microphone, label: "麦克风", value: microphoneAccessibilityValue, action: toggleMicrophone)
                 cameraMenu
                 mouseMenu
             }
@@ -917,12 +970,72 @@ private struct RecordingSetupView: View {
         .shadow(color: .black.opacity(0.16), radius: 4, x: 0, y: 4)
         .onChange(of: model.settings) { model.persist(); onCameraSettingsChanged() }
         .onChange(of: model.permissions[.camera]) { _, newValue in onCameraPermissionChanged(newValue) }
+        .onAppear { speakerFocused = true }
     }
 
-    private func recordToggle(_ asset: String, menu: Bool = true, isOn: Binding<Bool>) -> some View {
-        Button { isOn.wrappedValue.toggle() } label: {
-            Image(nsImage: recordingAsset("\(asset)-\(isOn.wrappedValue ? "on" : "off")", size: NSSize(width: 40, height: 36))).resizable().frame(width: 40, height: 36)
-        }.buttonStyle(.plain)
+    // MARK: - 状态解析（BRA-116：视觉 = 开关 + 权限 + 设备真值表，禁止用本地缓存导致漂移）
+
+    private var speakerOn: Bool {
+        RecordingSourceState.isOn(.speaker, settings: model.settings, permission: nil, deviceAvailable: RecordingDeviceAvailability.hasAudioOutputDevice())
+    }
+    private var microphoneOn: Bool {
+        RecordingSourceState.isOn(.microphone, settings: model.settings, permission: model.permissions[.microphone], deviceAvailable: RecordingDeviceAvailability.hasMicrophoneDevice())
+    }
+    private var cameraOn: Bool {
+        RecordingSourceState.isOn(.camera, settings: model.settings, permission: model.permissions[.camera], deviceAvailable: RecordingDeviceAvailability.hasCameraDevice())
+    }
+    private var mouseOn: Bool {
+        RecordingSourceState.isOn(.mouse, settings: model.settings, permission: nil, deviceAvailable: true)
+    }
+    private var microphoneAccessibilityValue: String {
+        guard model.settings.microphone else { return "已关闭" }
+        let name = RecordingDeviceAvailability.defaultMicrophoneName()
+        return name.isEmpty ? "已开启" : "已开启，\(name)"
+    }
+
+    // MARK: - 切换行为（失败回退 off + 提示，不出现假开启态）
+
+    private func toggleSpeaker() {
+        if model.settings.systemAudio {
+            model.settings.systemAudio = false
+        } else if RecordingDeviceAvailability.hasAudioOutputDevice() {
+            model.settings.systemAudio = true
+        } else {
+            model.showError("未找到音频输出设备")
+        }
+    }
+
+    private func toggleMicrophone() {
+        if model.settings.microphone {
+            model.setMicrophoneEnableIntent(false)
+            model.settings.microphone = false
+            return
+        }
+        switch model.permissions[.microphone] {
+        case .allowed:
+            if RecordingDeviceAvailability.hasMicrophoneDevice() { model.settings.microphone = true }
+            else { model.showError("未找到麦克风") }
+        case .notDetermined:
+            // BRA-116：无设备时不发起权限请求，直接提示（避免无意义弹窗与假开启态）。
+            if RecordingDeviceAvailability.hasMicrophoneDevice() {
+                model.setMicrophoneEnableIntent(true)
+                model.request(.microphone)
+            } else { model.showError("未找到麦克风") }
+        default:
+            model.showError("麦克风不可用。你仍可继续无麦克风录制。")
+        }
+    }
+
+    private func sourceButton(_ asset: String, isOn: Bool, pending: Bool, label: String, value: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(nsImage: recordingAsset("\(asset)-\(isOn ? "on" : "off")", size: NSSize(width: 40, height: 36))).resizable().frame(width: 40, height: 36)
+                .overlay(alignment: .topTrailing) {
+                    if pending { ProgressView().controlSize(.mini).offset(x: -6, y: 6) }
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .accessibilityValue(value)
     }
 
     private var cameraBinding: Binding<Bool> {
@@ -943,13 +1056,16 @@ private struct RecordingSetupView: View {
             Toggle("镜像", isOn: plain(\.cameraMirror))
             if cameraSupportsBackgroundBlur { Toggle("模糊背景", isOn: plain(\.cameraBackgroundBlur)) }
         } label: {
-            Image(nsImage: recordingAsset("record-camera-\((model.settings.cameraEnabled) ? "on" : "off")", size: NSSize(width: 40, height: 36))).resizable().frame(width: 40, height: 36)
+            Image(nsImage: recordingAsset("record-camera-\(cameraOn ? "on" : "off")", size: NSSize(width: 40, height: 36))).resizable().frame(width: 40, height: 36)
+                .overlay(alignment: .topTrailing) {
+                    if model.requesting == .camera { ProgressView().controlSize(.mini).offset(x: -6, y: 6) }
+                }
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .frame(width: 40, height: 36)
         .accessibilityLabel("摄像头")
-        .accessibilityValue(model.settings.cameraEnabled ? "已开启" : "已关闭")
+        .accessibilityValue(cameraOn ? "已开启" : "已关闭")
     }
 
     private var mouseMenu: some View {
@@ -957,11 +1073,13 @@ private struct RecordingSetupView: View {
             Toggle("显示鼠标指针", isOn: plain(\.showsCursor))
             Toggle("显示点击反馈", isOn: plain(\.showsClicks))
         } label: {
-            Image(nsImage: recordingAsset("record-cursor-\((model.settings.showsCursor || model.settings.showsClicks) ? "on" : "off")", size: NSSize(width: 40, height: 36))).resizable().frame(width: 40, height: 36)
+            Image(nsImage: recordingAsset("record-cursor-\(mouseOn ? "on" : "off")", size: NSSize(width: 40, height: 36))).resizable().frame(width: 40, height: 36)
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .frame(width: 40, height: 36)
+        .accessibilityLabel("鼠标设置")
+        .accessibilityValue(model.settings.showsCursor || model.settings.showsClicks ? "已开启" : "已关闭")
     }
 
     private func recordingAsset(_ name: String, size: NSSize) -> NSImage {
@@ -1115,21 +1233,23 @@ private final class RecordingRegionBorderView: NSView {
 @MainActor
 private final class RecordingStatusWindowController: NSWindowController {
     private let label = NSTextField(labelWithString: "")
+    private let recLabel = NSTextField(labelWithString: "● REC")
     private let stopButton = NSButton(title: "停止", target: nil, action: nil)
     private let stopBackground = NSImageView()
+    private var sourceViews: [(source: RecordingSource, view: NSImageView)] = []
     private var timer: Timer?
     private var started = Date()
-    private let sources: String
+    private let settings: AppSettings
     private var onStop: () -> Void
     private let screen: NSScreen
     private let selection: CGRect
 
-    init(screen: NSScreen, selection: CGRect, sources: String, onStop: @escaping () -> Void) {
-        self.sources = sources
+    init(screen: NSScreen, selection: CGRect, settings: AppSettings, onStop: @escaping () -> Void) {
+        self.settings = settings
         self.onStop = onStop
         self.screen = screen
         self.selection = selection
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 240, height: 72), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 450, height: 72), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
         panel.level = .screenSaver
         panel.isMovable = false
@@ -1139,15 +1259,13 @@ private final class RecordingStatusWindowController: NSWindowController {
         panel.hasShadow = true
         super.init(window: panel)
         label.font = .monospacedDigitSystemFont(ofSize: 16, weight: .bold); label.textColor = .white
+        recLabel.font = .systemFont(ofSize: 14, weight: .bold); recLabel.textColor = .white
         stopButton.target = self
         stopButton.action = #selector(stopPressed)
         stopButton.isBordered = false; stopButton.font = .systemFont(ofSize: 18, weight: .bold); stopButton.wantsLayer = true; stopButton.layer?.backgroundColor = NSColor(hex: "#FA5151")?.cgColor; stopButton.layer?.cornerRadius = 12; stopButton.contentTintColor = .white
-        let stack = NSStackView(views: [stopButton, label])
-        stack.orientation = .horizontal
-        stack.spacing = 10; stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
-        let root = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 72)); root.wantsLayer = true; root.layer?.backgroundColor = NSColor(hex: "#333333")?.cgColor; root.layer?.cornerRadius = 12; root.addSubview(stack); stack.frame = root.bounds; panel.contentView = root
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 450, height: 72)); root.wantsLayer = true; root.layer?.backgroundColor = NSColor(hex: "#333333")?.cgColor; root.layer?.cornerRadius = 12; root.addSubview(stopButton); panel.contentView = root
         let visible = screen.visibleFrame
-        let x = min(max(visible.minX, screen.frame.minX + selection.midX - 120), visible.maxX - 240)
+        let x = min(max(visible.minX, screen.frame.minX + selection.midX - 225), visible.maxX - 450)
         let below = screen.frame.minY + selection.minY - 80
         let y = below >= visible.minY ? below : min(visible.maxY - 72, screen.frame.minY + selection.maxY + 8)
         panel.setFrameOrigin(CGPoint(x: x, y: y))
@@ -1182,13 +1300,42 @@ private final class RecordingStatusWindowController: NSWindowController {
         label.stringValue = String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
 
+    /// 录制中来源断开（麦克风/摄像头）：对应图标切斜线（BRA-116，O-REC 来源状态）。
+    func setSourceLost(_ source: RecordingSource) {
+        guard let entry = sourceViews.first(where: { $0.source == source }) else { return }
+        entry.view.image = sourceImage(source, on: false)
+    }
+
     private func makeRecordingContent() {
-        window?.setContentSize(NSSize(width: 240, height: 72))
-        let root = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 72)); root.wantsLayer = true; root.layer?.backgroundColor = NSColor(hex: "#333333")?.cgColor; root.layer?.cornerRadius = 12; root.layer?.masksToBounds = true
-        stopBackground.image = recordingImage("record-stop", size: NSSize(width: 208, height: 40)); stopBackground.imageScaling = .scaleAxesIndependently; stopBackground.frame = NSRect(x: 16, y: 16, width: 208, height: 40); root.addSubview(stopBackground)
+        window?.setContentSize(NSSize(width: 450, height: 72))
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 450, height: 72)); root.wantsLayer = true; root.layer?.backgroundColor = NSColor(hex: "#333333")?.cgColor; root.layer?.cornerRadius = 12; root.layer?.masksToBounds = true
+        stopBackground.image = recordingImage("record-stop", size: NSSize(width: 208, height: 40)); stopBackground.imageScaling = .scaleAxesIndependently; stopBackground.frame = NSRect(x: 226, y: 16, width: 208, height: 40); root.addSubview(stopBackground)
         stopButton.frame = stopBackground.frame; stopButton.title = ""; stopButton.layer?.backgroundColor = NSColor.clear.cgColor; root.addSubview(stopButton)
-        label.frame = NSRect(x: 144, y: 26, width: 54, height: 20); label.alignment = .center; root.addSubview(label); window?.contentView = root
-        let visible = screen.visibleFrame; let x = min(max(visible.minX, screen.frame.minX + selection.midX - 120), visible.maxX - 240); let below = screen.frame.minY + selection.minY - 80; let y = below >= visible.minY ? below : min(visible.maxY - 72, screen.frame.minY + selection.maxY + 8); window?.setFrameOrigin(CGPoint(x: x, y: y))
+        recLabel.font = .systemFont(ofSize: 13, weight: .bold); recLabel.textColor = NSColor(hex: "#FA5151"); recLabel.frame = NSRect(x: 16, y: 30, width: 56, height: 16); root.addSubview(recLabel)
+        label.frame = NSRect(x: 80, y: 26, width: 54, height: 20); label.alignment = .center; root.addSubview(label)
+        sourceViews = Self.recordingSources(from: settings).map { source in
+            let image = NSImageView(image: sourceImage(source, on: true)); image.frame = NSRect(x: 0, y: 0, width: 22, height: 20); root.addSubview(image)
+            return (source, image)
+        }
+        for (index, entry) in sourceViews.enumerated() {
+            entry.view.frame = NSRect(x: 142 + CGFloat(index) * 26, y: 26, width: 22, height: 20)
+        }
+        window?.contentView = root
+        let visible = screen.visibleFrame; let x = min(max(visible.minX, screen.frame.minX + selection.midX - 225), visible.maxX - 450); let below = screen.frame.minY + selection.minY - 80; let y = below >= visible.minY ? below : min(visible.maxY - 72, screen.frame.minY + selection.maxY + 8); window?.setFrameOrigin(CGPoint(x: x, y: y))
+    }
+
+    private func sourceImage(_ source: RecordingSource, on: Bool) -> NSImage {
+        let name = "\(source.assetBase)-\(on ? "on" : "off")"
+        return recordingImage(name, size: NSSize(width: 22, height: 20))
+    }
+
+    /// 本次录制的来源快照（beginCountdown 已降级权限/设备不可用来源）。
+    private static func recordingSources(from settings: AppSettings) -> [RecordingSource] {
+        var sources: [RecordingSource] = []
+        if settings.systemAudio { sources.append(.speaker) }
+        if settings.microphone { sources.append(.microphone) }
+        if settings.cameraEnabled { sources.append(.camera) }
+        return sources
     }
 
     private func recordingImage(_ name: String, size: NSSize) -> NSImage {

@@ -47,24 +47,36 @@ enum ScrollingOverlapMatcher {
         let lastActive = activeColumns.last ?? (width - 1)
         let contentRange = (firstActive > edgeThreshold ? max(0, firstActive - padding) : 0)..<(width - lastActive > edgeThreshold ? min(width, lastActive + padding + 1) : width)
         let contentRows = movingRows(oldBytes, newBytes, width: width, height: height, columns: activeColumns)
+        // Compare the whole sampled region, not only "textured" rows: a vertical-gradient
+        // texture filter rejects exactly the distinguishing pixels of text-like content
+        // (glyph bands have identical vertically-adjacent pixels), leaving spurious
+        // self-similar alignments with score 0 and letting the wrong overlap win.
+        // A uniform sample of every overlap region keeps the true overlap at 0 while
+        // pushing mis-aligned candidates measurably above it.
         let contentHeight = contentRows.count
 
-        // A larger jump is indistinguishable from a repeated list; capture more often instead of guessing.
+        // Scan every overlap candidate in range. The coarse-to-fine shortcut could lock
+        // onto a self-similar false valley and never evaluate the true overlap when it
+        // falls off the coarse grid, so evaluate all of them.
         let minimum = max(1, contentHeight / 2)
         let maximum = contentHeight - 2
-        let step = max(1, contentHeight / 80)
-        var candidates = stride(from: minimum, through: maximum, by: step).map {
-            Match(overlap: $0, score: score(oldBytes, newBytes, width: width, overlap: $0, columns: activeColumns, rows: contentRows), contentRange: contentRange, contentRows: contentRows)
+        guard minimum <= maximum else { return nil }
+        var candidates: [Match] = []
+        candidates.reserveCapacity(maximum - minimum + 1)
+        for overlap in minimum...maximum {
+            candidates.append(Match(overlap: overlap, score: score(oldBytes, newBytes, width: width, overlap: overlap, columns: activeColumns, rows: contentRows), contentRange: contentRange, contentRows: contentRows))
         }
-        guard let coarse = candidates.min(by: { $0.score < $1.score }) else { return nil }
-        let lower = max(minimum, coarse.overlap - step)
-        let upper = min(maximum, coarse.overlap + step)
-        candidates.append(contentsOf: (lower...upper).map {
-            Match(overlap: $0, score: score(oldBytes, newBytes, width: width, overlap: $0, columns: activeColumns, rows: contentRows), contentRange: contentRange, contentRows: contentRows)
-        })
         guard let best = candidates.min(by: { $0.score < $1.score }), best.score <= 28 else { return nil }
-        let ambiguous = candidates.contains { abs($0.overlap - best.overlap) > max(4, step) && $0.score <= best.score + 2 }
-        return ambiguous ? nil : best
+        // Prefer the largest near-optimal overlap: with self-similar rows every spurious
+        // zero-score valley sits *below* the true overlap, so picking the largest candidate
+        // within tolerance lands on the true scroll amount instead of re-appending stitched
+        // content. If near-optimal candidates span a wide range the content is genuinely
+        // ambiguous (e.g. a repeating list); stop and let the caller capture more often.
+        let nearOptimal = candidates.filter { $0.score <= best.score + 2 }
+        let spanLow = nearOptimal.map(\.overlap).min() ?? best.overlap
+        let spanHigh = nearOptimal.map(\.overlap).max() ?? best.overlap
+        guard spanHigh - spanLow <= 4 else { return nil }
+        return nearOptimal.max(by: { $0.overlap < $1.overlap })
     }
 
     private static func score(_ old: [UInt8], _ new: [UInt8], width: Int, overlap: Int, columns: [Int], rows: Range<Int>) -> Int {
@@ -74,10 +86,6 @@ enum ScrollingOverlapMatcher {
             for x in columns {
                 let oldY = rows.upperBound - overlap + row, newY = rows.lowerBound + row
                 let oldIndex = (oldY * width + x) * 4, newIndex = (newY * width + x) * 4
-                let oldNeighbor = (min(rows.upperBound - 1, oldY + 1) * width + x) * 4
-                let newNeighbor = (min(rows.upperBound - 1, newY + 1) * width + x) * 4
-                let texture = (0..<3).reduce(0) { $0 + abs(Int(old[$1 + oldIndex]) - Int(old[$1 + oldNeighbor])) + abs(Int(new[$1 + newIndex]) - Int(new[$1 + newNeighbor])) }
-                guard texture >= 18 else { continue }
                 difference += abs(Int(old[oldIndex]) - Int(new[newIndex]))
                 difference += abs(Int(old[oldIndex + 1]) - Int(new[newIndex + 1]))
                 difference += abs(Int(old[oldIndex + 2]) - Int(new[newIndex + 2]))
@@ -224,15 +232,13 @@ final class ScrollingCaptureCoordinator {
 private final class ScrollingSession {
     private let filter: SCContentFilter
     private let config = SCStreamConfiguration()
-    private(set) var segments: [CGImage] = []
-    private var frames: [CGImage] = []
-    private var contentRange: Range<Int>?
-    private var contentRows: Range<Int>?
-    private(set) var warning = false
-    private(set) var atMaximum = false
+    private var stitcher = ScrollingStitcher()
 
-    var height: Int { segments.reduce(0) { $0 + $1.height } }
-    var width: Int { segments.first?.width ?? config.width }
+    var warning: Bool { stitcher.warning }
+    var atMaximum: Bool { stitcher.atMaximum }
+
+    var height: Int { stitcher.height }
+    var width: Int { stitcher.width }
 
     init(filter: SCContentFilter, source: CGRect, width: Int, height: Int) {
         self.filter = filter
@@ -244,8 +250,30 @@ private final class ScrollingSession {
     }
 
     func capture() async throws -> String {
-        guard !atMaximum else { return "已达到长图上限" }
+        guard !stitcher.atMaximum else { return "已达到长图上限" }
         let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        return stitcher.ingest(image)
+    }
+
+    func render() -> CGImage? { stitcher.render() }
+
+    func preview() -> CGImage? { stitcher.preview() }
+}
+
+// Pure frame-by-frame stitching state, isolated from screen capture so the overlap→crop→append
+// pipeline can be exercised in tests with synthetic frames.
+struct ScrollingStitcher {
+    private(set) var segments: [CGImage] = []
+    private var frames: [CGImage] = []
+    private var contentRange: Range<Int>?
+    private(set) var warning = false
+    private(set) var atMaximum = false
+
+    var height: Int { segments.reduce(0) { $0 + $1.height } }
+    var width: Int { segments.first?.width ?? 0 }
+
+    mutating func ingest(_ image: CGImage) -> String {
+        guard !atMaximum else { return "已达到长图上限" }
         let segment: CGImage
         if let lastFrame = frames.last {
             guard let match = ScrollingOverlapMatcher.overlap(old: lastFrame, new: image) else { return "已暂停：无法找到连续内容" }
@@ -253,11 +281,13 @@ private final class ScrollingSession {
             if match.contentRows.count - match.overlap < max(8, match.contentRows.count / 200) { return "未检测到足够滚动；继续向下滚动即可" }
             if contentRange == nil {
                 contentRange = match.contentRange
-                contentRows = match.contentRows
                 if let first = segments.first?.cropping(to: CGRect(x: match.contentRange.lowerBound, y: match.contentRows.lowerBound, width: match.contentRange.count, height: match.contentRows.count)) { segments[0] = first }
             }
             let range = contentRange ?? 0..<image.width
-            let rows = contentRows ?? 0..<image.height
+            // Crop using the *current* match's rows: the overlap is measured relative to
+            // this pair's moving rows, so reusing a stale frozen lowerBound would shift the
+            // strip and re-append already-stitched content when the moving region changes.
+            let rows = match.contentRows
             guard let cropped = image.cropping(to: CGRect(x: range.lowerBound, y: rows.lowerBound + match.overlap, width: range.count, height: rows.count - match.overlap)) else { return "已暂停：无法读取连续内容" }
             segment = cropped
         } else { segment = image }
@@ -295,7 +325,6 @@ private final class ScrollingSession {
         }
         return context.makeImage()
     }
-
 }
 
 enum ScrollingCaptureLayout {

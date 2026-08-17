@@ -193,6 +193,26 @@ final class SettingsTests: XCTestCase {
     }
 
     @MainActor
+    func testNewlyDrawnAnnotationIsAutoSelectedSoStyleAppliesImmediately() {
+        let image = CGImage(width: 40, height: 40, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 160, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue), provider: CGDataProvider(data: Data(repeating: 255, count: 6_400) as CFData)!, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+        let view = AnnotationView(image: image, settings: .defaults)
+        func event(_ type: NSEvent.EventType, _ point: CGPoint) -> NSEvent { NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)! }
+        for tool in [AnnotationTool.mosaic, .pen, .arrow] {
+            view.tool = tool
+            view.mouseDown(with: event(.leftMouseDown, CGPoint(x: 4, y: 4)))
+            view.mouseDragged(with: event(.leftMouseDragged, CGPoint(x: 24, y: 18)))
+            view.mouseUp(with: event(.leftMouseUp, CGPoint(x: 24, y: 18)))
+            view.applyStyleLive(color: .systemBlue, size: 5)
+            guard let last = view.stateSnapshot.annotations.last else { return XCTFail("Expected a drawn \(tool.rawValue) annotation") }
+            switch last {
+            case .path(_, _, let width): XCTAssertEqual(width, 5, "\(tool.rawValue) should be auto-selected so size applies")
+            case .line(_, _, _, _, let width): XCTAssertEqual(width, 5, "\(tool.rawValue) should be auto-selected so size applies")
+            case .text: XCTFail("Unexpected text annotation for \(tool.rawValue)")
+            }
+        }
+    }
+
+    @MainActor
     func testClickingExistingShapeWithAnotherToolDoesNotCreateAnotherShape() {
         let image = CGImage(width: 40, height: 40, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 160, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue), provider: CGDataProvider(data: Data(repeating: 255, count: 6_400) as CFData)!, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
         let view = AnnotationView(image: image, settings: .defaults)
