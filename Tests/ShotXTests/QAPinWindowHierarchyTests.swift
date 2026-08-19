@@ -34,5 +34,6 @@ final class QAPinWindowHierarchyTests: XCTestCase {
         XCTAssertTrue(hasSlider, "pin controls must include sliders")
         XCTAssertTrue(hasCloseButton, "关闭 button must be a subview")
         XCTAssertEqual(sliders.count, 2, "pin controls must include opacity and zoom")
+        XCTAssertFalse(content.layer?.sublayers?.contains(where: { $0 is CAShapeLayer }) == true, "pin corner must not draw a second outline over the clipped image")
     }
 }

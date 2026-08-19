@@ -225,10 +225,10 @@ final class AnnotationView: NSView {
         } else if tool == .text {
             beginTextEntry(at: start)
         } else if tool == .crop { remember(); cropRect = rect(start, end).intersection(bounds) }
-        else if tool == .pen { remember(); annotations.append(.path(draftPath.count > 1 ? draftPath : [start, end], color(for: tool), size(for: tool))) }
+        else if tool == .pen { remember(); annotations.append(.path(draftPath.count > 1 ? draftPath : [start, end], color(for: tool), size(for: tool))); selected = annotations.count - 1 }
         else {
             remember(); annotations.append(.line(tool, start, end, color(for: tool), size(for: tool)))
-            if tool == .line || tool == .arrow { selected = annotations.count - 1 }
+            selected = annotations.count - 1
         }
         moving = false
     }
@@ -237,7 +237,7 @@ final class AnnotationView: NSView {
         finishTextEntry(commit: true)
         let field = NSTextField(frame: CGRect(x: point.x, y: point.y, width: min(280, max(80, bounds.width - point.x)), height: max(28, size(for: .text) + 12)))
         field.placeholderString = "输入文字"
-        field.font = .systemFont(ofSize: size(for: .text), weight: .semibold)
+        field.font = AppFonts.annotationFont(size: size(for: .text))
         field.textColor = color(for: .text); field.backgroundColor = NSColor.black.withAlphaComponent(0.72); field.drawsBackground = true
         field.isBordered = true; field.focusRingType = .default; field.target = self; field.action = #selector(commitTextEntry(_:))
         addSubview(field); textEditor = field; window?.makeFirstResponder(field)
@@ -249,10 +249,10 @@ final class AnnotationView: NSView {
         editingTextIndex = index
         selected = index
         textStyle = style
-        let textSize = text.size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold)])
+        let textSize = text.size(withAttributes: [.font: AppFonts.annotationFont(size: size)])
         let field = NSTextField(frame: CGRect(x: point.x, y: point.y, width: min(max(80, textSize.width + 28), max(80, bounds.width - point.x)), height: max(28, size + 12)))
         field.stringValue = text
-        field.font = .systemFont(ofSize: size, weight: .semibold)
+        field.font = AppFonts.annotationFont(size: size)
         field.textColor = color; field.backgroundColor = NSColor.black.withAlphaComponent(0.72); field.drawsBackground = true
         field.isBordered = true; field.focusRingType = .default; field.target = self; field.action = #selector(commitTextEntry(_:))
         addSubview(field); textEditor = field; window?.makeFirstResponder(field); needsDisplay = true
@@ -307,7 +307,7 @@ final class AnnotationView: NSView {
         case .path(let points, _, _): annotations[selected] = .path(points, color, size)
         case .text(let text, _, _, _, let style):
             let oldBounds = bounds(of: annotations[selected])
-            let measured = text.size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold)])
+            let measured = text.size(withAttributes: [.font: AppFonts.annotationFont(size: size)])
             annotations[selected] = .text(text, CGPoint(x: oldBounds.midX - measured.width / 2, y: oldBounds.midY - measured.height / 2), color, size, style)
         }
         needsDisplay = true
@@ -403,7 +403,7 @@ final class AnnotationView: NSView {
         }
     }
     private func drawText(_ text: String, at point: CGPoint, color: NSColor, size: CGFloat, style: AnnotationTextStyle) {
-        let font = NSFont.systemFont(ofSize: size, weight: .semibold)
+        let font = AppFonts.annotationFont(size: size)
         let outline = Self.focusedStroke(for: color)
         switch style {
         case .normal:
@@ -464,7 +464,7 @@ final class AnnotationView: NSView {
         undoStack.append(stateSnapshot); if undoStack.count > 20 { undoStack.removeFirst() }; redoStack.removeAll()
     }
     private func offset(_ item: Annotation, dx: CGFloat, dy: CGFloat) -> Annotation { switch item { case .line(let tool, let a, let b, let color, let width): .line(tool, CGPoint(x: a.x + dx, y: a.y + dy), CGPoint(x: b.x + dx, y: b.y + dy), color, width); case .path(let points, let color, let width): .path(points.map { CGPoint(x: $0.x + dx, y: $0.y + dy) }, color, width); case .text(let text, let point, let color, let size, let style): .text(text, CGPoint(x: point.x + dx, y: point.y + dy), color, size, style) } }
-    private func bounds(of item: Annotation) -> CGRect { switch item { case .line(let tool, let a, let b, _, let width): tool == .mosaic ? rect(a, b) : rect(a, b).insetBy(dx: -max(4, width), dy: -max(4, width)); case .path(let points, _, let width): points.reduce(CGRect.null) { $0.union(CGRect(origin: $1, size: .zero)) }.insetBy(dx: -max(4, width), dy: -max(4, width)); case .text(let text, let point, _, let size, _): CGRect(origin: point, size: text.size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold)])) } }
+    private func bounds(of item: Annotation) -> CGRect { switch item { case .line(let tool, let a, let b, _, let width): tool == .mosaic ? rect(a, b) : rect(a, b).insetBy(dx: -max(4, width), dy: -max(4, width)); case .path(let points, _, let width): points.reduce(CGRect.null) { $0.union(CGRect(origin: $1, size: .zero)) }.insetBy(dx: -max(4, width), dy: -max(4, width)); case .text(let text, let point, _, let size, _): CGRect(origin: point, size: text.size(withAttributes: [.font: AppFonts.annotationFont(size: size)])) } }
     private func endpoint(at point: CGPoint) -> LineEndpoint? {
         guard let selected, case .line(let tool, let start, let end, _, _) = annotations[selected], tool == .line || tool == .arrow else { return nil }
         if hypot(point.x - start.x, point.y - start.y) <= 10 { return .start }
@@ -547,6 +547,7 @@ final class PinWindowController: NSWindowController {
     private let opacityValueLabel = NSTextField(labelWithString: "100%")
     private let zoomValueLabel = NSTextField(labelWithString: "100%")
     private var scale: CGFloat
+    private var zoomRangeVisible: NSSize = .zero
 
     static func show(_ image: NSImage) { let controller = PinWindowController(image: image); controllers.append(controller); controller.showWindow(nil) }
 
@@ -578,6 +579,7 @@ final class PinWindowController: NSWindowController {
         controls.addArrangedSubview(Self.controlRow(label: "透明度", slider: opacitySlider, valueLabel: opacityValueLabel))
         controls.addArrangedSubview(Self.controlRow(label: "缩  放", slider: zoomSlider, valueLabel: zoomValueLabel))
         content.addSubview(controls)
+        applyZoomSliderRange(for: visible)
         zoomSlider.doubleValue = Double(scale)
         zoomValueLabel.stringValue = PinZoom.percent(Double(scale))
         layout()
@@ -598,18 +600,31 @@ final class PinWindowController: NSWindowController {
         setScale(scale * PinZoom.zoomFactor(deltaY: delta, precise: precise))
     }
 
+    private func zoomBounds(for visible: NSSize) -> (minimum: CGFloat, maximum: CGFloat) {
+        let minimum = max(PinZoom.minScale, 100 / max(1, baseImage.size.width), 100 / max(1, baseImage.size.height))
+        let maximum = min(PinZoom.maxScale, visible.width / max(1, baseImage.size.width), visible.height / max(1, baseImage.size.height))
+        return (minimum, maximum)
+    }
+
+    private func applyZoomSliderRange(for visible: NSSize) {
+        guard visible != zoomRangeVisible else { return }
+        zoomRangeVisible = visible
+        let bounds = zoomBounds(for: visible)
+        zoomSlider.minValue = Double(bounds.minimum)
+        zoomSlider.maxValue = Double(bounds.maximum)
+    }
+
     private func setScale(_ proposed: CGFloat) {
         guard let window else { return }
         let visible = window.screen?.visibleFrame.size ?? NSScreen.main?.visibleFrame.size ?? NSSize(width: 800, height: 600)
-        let minimum = max(PinZoom.minScale, 100 / max(1, baseImage.size.width), 100 / max(1, baseImage.size.height))
-        let maximum = min(PinZoom.maxScale, visible.width / max(1, baseImage.size.width), visible.height / max(1, baseImage.size.height))
-        let next = min(maximum, max(min(minimum, maximum), proposed))
+        applyZoomSliderRange(for: visible)
+        let bounds = zoomBounds(for: visible)
+        let next = min(bounds.maximum, max(min(bounds.minimum, bounds.maximum), proposed))
         guard next != scale else { return }
         scale = next
         let imageArea = NSSize(width: max(1, baseImage.size.width * scale), height: max(1, baseImage.size.height * scale))
         let frame = window.frame
         window.setFrame(NSRect(x: frame.midX - imageArea.width / 2, y: frame.midY - imageArea.height / 2, width: imageArea.width, height: imageArea.height), display: true, animate: false)
-        zoomSlider.maxValue = Double(maximum)
         zoomSlider.doubleValue = Double(scale)
         zoomValueLabel.stringValue = PinZoom.percent(Double(scale))
         zoomSlider.setAccessibilityValue(PinZoom.voiceOverValue(Double(scale)))
@@ -646,23 +661,11 @@ final class PinWindowController: NSWindowController {
 
 private final class PinContainerView: NSView {
     var onHoverChanged: ((Bool) -> Void)?
-    private let border = CAShapeLayer()
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        border.fillColor = NSColor.clear.cgColor
-        border.strokeColor = NSColor.black.withAlphaComponent(0.2).cgColor
-        border.lineWidth = 1
-        border.zPosition = 1000
-        layer?.addSublayer(border)
     }
     required init?(coder: NSCoder) { fatalError() }
-    override func layout() {
-        super.layout()
-        border.frame = bounds
-        border.contentsScale = window?.backingScaleFactor ?? 2
-        border.path = CGPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), cornerWidth: 7.5, cornerHeight: 7.5, transform: nil)
-    }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea)

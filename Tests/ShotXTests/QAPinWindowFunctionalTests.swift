@@ -133,6 +133,30 @@ final class QAPinWindowFunctionalTests: XCTestCase {
         XCTAssertEqual(zoomSlider.doubleValue, Double(expectedScale), accuracy: 0.01)
     }
 
+    func testZoomSliderRangeIsStableAndDoesNotRemapMidDrag() throws {
+        let visible = NSScreen.main?.visibleFrame.size ?? NSSize(width: 800, height: 600)
+        let imageSize = NSSize(width: visible.width * 2, height: visible.height * 1.5)
+        let (controller, window) = makeWindow(imageSize: imageSize)
+        controller.showWindow(nil)
+        defer { window.close() }
+        let visibleOnScreen = window.screen?.visibleFrame.size ?? visible
+        let expectedMinimum = max(PinZoom.minScale, 100 / imageSize.width, 100 / imageSize.height)
+        let expectedMaximum = min(PinZoom.maxScale, visibleOnScreen.width / imageSize.width, visibleOnScreen.height / imageSize.height)
+        let zoomSlider = try XCTUnwrap(window.contentView!.allSubviews().compactMap { $0 as? NSSlider }.first { $0.accessibilityLabel() == "缩放" })
+
+        XCTAssertEqual(zoomSlider.minValue, Double(expectedMinimum), accuracy: 0.0001, "slider min must be the usable minimum, not the hardcoded 10%")
+        XCTAssertEqual(zoomSlider.maxValue, Double(expectedMaximum), accuracy: 0.0001, "slider max must be the usable maximum, not the hardcoded 300%")
+
+        let maxBefore = zoomSlider.maxValue
+        zoomSlider.doubleValue = 99
+        zoomSlider.sendAction(zoomSlider.action, to: zoomSlider.target)
+        XCTAssertEqual(zoomSlider.maxValue, maxBefore, accuracy: 0.0001, "zooming above the maximum must not remap the slider range mid-drag")
+        XCTAssertEqual(zoomSlider.doubleValue, Double(expectedMaximum), accuracy: 0.0001, "scale must clamp to the usable maximum")
+
+        zoomSlider.sendAction(zoomSlider.action, to: zoomSlider.target)
+        XCTAssertEqual(zoomSlider.doubleValue, Double(expectedMaximum), accuracy: 0.0001, "repeated out-of-range value must not oscillate")
+    }
+
     func testOpacityReadoutUpdatesInRealTimeOnSliderChange() throws {
         let controller = makeWindow(imageSize: NSSize(width: 200, height: 100)).controller
         let sliders = controller.window!.contentView!.allSubviews().compactMap { $0 as? NSSlider }

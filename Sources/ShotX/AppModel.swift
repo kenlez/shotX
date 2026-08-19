@@ -81,6 +81,10 @@ struct AppSettings: Codable, Equatable {
     var microphone = false
     // Optional keeps settings written by older ShotX builds decodable.
     private var camera: Bool? = false
+    private var cameraSizeValue: CameraOverlaySize?
+    private var cameraMirrorValue: Bool?
+    private var cameraBackgroundBlurValue: Bool?
+    private var selectedCameraIDValue: String?
     var selectedMicrophoneID = ""
     var showsCursor = true
     var showsClicks = true
@@ -94,6 +98,25 @@ struct AppSettings: Codable, Equatable {
     var cameraEnabled: Bool {
         get { camera ?? false }
         set { camera = newValue }
+    }
+    /// 画中画尺寸档位（BRA102-05，大/小两档）。
+    var cameraSize: CameraOverlaySize {
+        get { cameraSizeValue ?? .large }
+        set { cameraSizeValue = newValue }
+    }
+    /// 摄像头镜像（BRA102-06，默认开：自拍镜像习惯）。
+    var cameraMirror: Bool {
+        get { cameraMirrorValue ?? true }
+        set { cameraMirrorValue = newValue }
+    }
+    /// 摄像头模糊背景（BRA102-06，仅系统支持时展示并生效）。
+    var cameraBackgroundBlur: Bool {
+        get { cameraBackgroundBlurValue ?? false }
+        set { cameraBackgroundBlurValue = newValue }
+    }
+    var selectedCameraID: String {
+        get { selectedCameraIDValue ?? "" }
+        set { selectedCameraIDValue = newValue }
     }
     func shortcut(for mode: CaptureMode) -> Shortcut { shortcuts[mode.rawValue] ?? .none }
 }
@@ -161,6 +184,14 @@ enum PermissionState: String {
     case checking = "正在检查…"
 }
 
+/// 屏幕录制权限请求结果。`suppressed` 表示请求被系统静默抑制（未弹窗、未注册 TCC），
+/// 此时不得置位 `screenPermissionAsked`，否则后续将永远不再真实申请。
+enum ScreenPermissionPromptOutcome: Equatable {
+    case granted
+    case denied
+    case suppressed
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var settings: AppSettings
@@ -168,12 +199,52 @@ final class AppModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var recentResult: RecentResult?
     @Published private(set) var recording = false
+    /// 正在等待系统弹窗决定的权限（O-RSET 行内 spinner，BRA-116）。nil 表示无进行中的请求。
+    @Published private(set) var requesting: PermissionKind?
+    /// 录制开始时刻与菜单栏「停止录制 00:12」同步文本（O-REC 联动，BRA-116）。
+    @Published private(set) var recordingStartedAt: Date?
+    @Published private(set) var recordingElapsedText: String?
     @Published private(set) var launchAtLogin = [SMAppService.Status.enabled, .requiresApproval].contains(SMAppService.mainApp.status)
 
     private let defaults: UserDefaults
     private let settingsKey = "settings.v1"
+    private let screenPermissionAskedKey = "screenPermissionAsked.v1"
     private let hotKeys = HotKeyManager()
     private var started = false
+    private var elapsedTimer: Timer?
+
+    /// Injectable screen-permission request for tests; production uses the system prompt.
+    /// 生产实现临时把 LSUIElement accessory 应用切到 `.regular` 并激活后再请求，
+    /// 否则系统权限弹窗会被 macOS 静默抑制（不弹窗、不注册 TCC、直接返回 false）。
+    var requestScreenAccess: () -> ScreenPermissionPromptOutcome = {
+        let original = NSApp?.activationPolicy()
+        if let original { NSApp?.setActivationPolicy(.regular) }
+        NSApp?.activate(ignoringOtherApps: true)
+        let granted = CGRequestScreenCaptureAccess()
+        if let original {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(1))
+                NSApp?.setActivationPolicy(original)
+            }
+        }
+        return granted ? .granted : .denied
+    }
+
+    /// Injectable audio-permission request for tests; production uses `AVCaptureDevice.requestAccess`.
+    var requestAudioAccess: (@escaping (Bool) -> Void) -> Void = { completion in
+        AVCaptureDevice.requestAccess(for: .audio, completionHandler: completion)
+    }
+
+    /// Injectable camera-permission request for tests; production uses `AVCaptureDevice.requestAccess`.
+    var requestVideoAccess: (@escaping (Bool) -> Void) -> Void = { completion in
+        AVCaptureDevice.requestAccess(for: .video, completionHandler: completion)
+    }
+
+    /// True once the user has gone through a screen-recording permission decision.
+    private(set) var screenPermissionAsked: Bool {
+        get { defaults.bool(forKey: screenPermissionAskedKey) }
+        set { defaults.set(newValue, forKey: screenPermissionAskedKey) }
+    }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -213,7 +284,9 @@ final class AppModel: ObservableObject {
             recentResult = .video(recovery, saved: false)
             errorMessage = "发现可恢复的录屏。可从“最近一次结果”预览、复制或另存。"
         }
-        Task { await refreshPermissions() }
+        Task {
+            await refreshPermissions()
+        }
     }
 
     func shortcut(for mode: CaptureMode) -> Shortcut { settings.shortcut(for: mode) }
@@ -305,7 +378,18 @@ final class AppModel: ObservableObject {
     }
 
     func requestScreenPermission() {
-        if !CGRequestScreenCaptureAccess() { openPrivacySettings(.screen) }
+        // BRA102-01: 任何系统权限请求发起时不得存在 .screenSaver 级蒙层。先清掉捕获浮层再申请，
+        // 避免系统权限弹窗被蒙层盖住无法点击。
+        CaptureCoordinator.shared.cancel()
+        let outcome = requestScreenAccess()
+        switch outcome {
+        case .granted, .denied:
+            // BRA120-02: flag 仅在系统弹窗真实发出（无论授权/拒绝）后置位。
+            // 请求被抑制时保持未询问，保证之后仍可再次真实申请。
+            screenPermissionAsked = true
+        case .suppressed:
+            break
+        }
         Task { await refreshPermissions() }
     }
 
@@ -313,12 +397,72 @@ final class AppModel: ObservableObject {
         switch kind {
         case .screen: requestScreenPermission()
         case .systemAudio: openPrivacySettings(.screen)
-        case .microphone:
-            AVCaptureDevice.requestAccess(for: .audio) { [weak self] _ in Task { await self?.refreshPermissions() } }
-        case .camera:
-            AVCaptureDevice.requestAccess(for: .video) { [weak self] _ in Task { await self?.refreshPermissions() } }
+        case .microphone: requestMicrophoneAccess()
+        case .camera: requestCameraAccess()
         }
     }
+
+    /// 与屏幕权限同理：LSUIElement accessory 应用需先转正激活，系统权限弹窗才能真实弹出并注册 shotX。
+    /// 保持激活策略直到用户在系统弹窗做出决定（回调），再恢复原策略。
+    /// BRA-116：开启仅按需申请（不预置开关），授权成功且用户仍想开启才落定 `settings.microphone`。
+    private func requestMicrophoneAccess() {
+        let original = NSApp?.activationPolicy()
+        if original != nil { NSApp?.setActivationPolicy(.regular) }
+        NSApp?.activate(ignoringOtherApps: true)
+        requesting = .microphone
+        requestAudioAccess { [weak self] granted in
+            Task { @MainActor in
+                guard let self else { return }
+                if let original { NSApp?.setActivationPolicy(original) }
+                self.requesting = nil
+                if granted {
+                    if self.microphoneEnableIntent {
+                        self.settings.microphone = true
+                        self.persist()
+                    }
+                } else {
+                    // BRA102-02/UX 标注：拒绝后对应开关自动关闭，不保留开启的假状态。
+                    self.settings.microphone = false
+                    self.persist()
+                    self.showError("麦克风不可用。你仍可继续无麦克风录制。")
+                }
+                self.microphoneEnableIntent = false
+                await self.refreshPermissions()
+            }
+        }
+    }
+
+    private func requestCameraAccess() {
+        let original = NSApp?.activationPolicy()
+        if original != nil { NSApp?.setActivationPolicy(.regular) }
+        NSApp?.activate(ignoringOtherApps: true)
+        requesting = .camera
+        requestVideoAccess { [weak self] granted in
+            Task { @MainActor in
+                guard let self else { return }
+                if let original { NSApp?.setActivationPolicy(original) }
+                self.requesting = nil
+                if granted {
+                    if self.cameraEnableIntent {
+                        self.settings.cameraEnabled = true
+                        self.persist()
+                    }
+                } else {
+                    self.settings.cameraEnabled = false
+                    self.persist()
+                    self.showError("摄像头不可用。你仍可继续无摄像头录制。")
+                }
+                self.cameraEnableIntent = false
+                await self.refreshPermissions()
+            }
+        }
+    }
+
+    /// 按需申请期间记录用户「仍想开启」的意图；用户在弹窗期间关闭开关则授权回调不重新置开（BRA-116）。
+    private(set) var microphoneEnableIntent = false
+    private(set) var cameraEnableIntent = false
+    func setMicrophoneEnableIntent(_ wants: Bool) { microphoneEnableIntent = wants }
+    func setCameraEnableIntent(_ wants: Bool) { cameraEnableIntent = wants }
 
     func openPrivacySettings(_ kind: PermissionKind) {
         let pane = switch kind {
@@ -347,7 +491,28 @@ final class AppModel: ObservableObject {
         catch { showError("无法丢弃恢复文件。文件仍保留，可在访达中处理。"); return false }
     }
 
-    func setRecording(_ value: Bool) { recording = value }
+    func setRecording(_ value: Bool) {
+        recording = value
+        if value {
+            recordingStartedAt = Date()
+            tickRecordingElapsed()
+            elapsedTimer?.invalidate()
+            elapsedTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.tickRecordingElapsed() }
+            }
+        } else {
+            elapsedTimer?.invalidate()
+            elapsedTimer = nil
+            recordingStartedAt = nil
+            recordingElapsedText = nil
+        }
+    }
+
+    private func tickRecordingElapsed() {
+        guard let started = recordingStartedAt else { return }
+        let total = Int(Date().timeIntervalSince(started))
+        recordingElapsedText = String(format: "%02d:%02d", total / 60, total % 60)
+    }
 
     var lastImage: NSImage? {
         get { if case .image(let image) = recentResult { image } else { nil } }

@@ -193,6 +193,26 @@ final class SettingsTests: XCTestCase {
     }
 
     @MainActor
+    func testNewlyDrawnAnnotationIsAutoSelectedSoStyleAppliesImmediately() {
+        let image = CGImage(width: 40, height: 40, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 160, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue), provider: CGDataProvider(data: Data(repeating: 255, count: 6_400) as CFData)!, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+        let view = AnnotationView(image: image, settings: .defaults)
+        func event(_ type: NSEvent.EventType, _ point: CGPoint) -> NSEvent { NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)! }
+        for tool in [AnnotationTool.mosaic, .pen, .arrow] {
+            view.tool = tool
+            view.mouseDown(with: event(.leftMouseDown, CGPoint(x: 4, y: 4)))
+            view.mouseDragged(with: event(.leftMouseDragged, CGPoint(x: 24, y: 18)))
+            view.mouseUp(with: event(.leftMouseUp, CGPoint(x: 24, y: 18)))
+            view.applyStyleLive(color: .systemBlue, size: 5)
+            guard let last = view.stateSnapshot.annotations.last else { return XCTFail("Expected a drawn \(tool.rawValue) annotation") }
+            switch last {
+            case .path(_, _, let width): XCTAssertEqual(width, 5, "\(tool.rawValue) should be auto-selected so size applies")
+            case .line(_, _, _, _, let width): XCTAssertEqual(width, 5, "\(tool.rawValue) should be auto-selected so size applies")
+            case .text: XCTFail("Unexpected text annotation for \(tool.rawValue)")
+            }
+        }
+    }
+
+    @MainActor
     func testClickingExistingShapeWithAnotherToolDoesNotCreateAnotherShape() {
         let image = CGImage(width: 40, height: 40, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 160, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue), provider: CGDataProvider(data: Data(repeating: 255, count: 6_400) as CFData)!, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
         let view = AnnotationView(image: image, settings: .defaults)
@@ -249,10 +269,68 @@ final class SettingsTests: XCTestCase {
 
     func testCameraOverlayStaysInsideRecordedRegion() {
         let bounds = CGRect(x: 0, y: 0, width: 1280, height: 720)
-        let camera = CameraOverlayLayout.rect(in: bounds)
-        XCTAssertTrue(bounds.contains(camera))
-        XCTAssertEqual(camera.width / camera.height, 4.0 / 3.0, accuracy: 0.001)
-        XCTAssertEqual(camera.maxX, bounds.maxX - 12)
+        let camera = CameraOverlayLayout.rect(in: bounds, size: .large, scale: 1)
+        XCTAssertNotNil(camera)
+        XCTAssertTrue(bounds.contains(camera!))
+        XCTAssertEqual(camera!.width, camera!.height)
+        XCTAssertEqual(camera!.minX, bounds.minX + 12)
+        XCTAssertEqual(camera!.minY, bounds.minY + 12)
+    }
+
+    func testCameraOverlayTwoSizesPresetsAndClamping() {
+        XCTAssertEqual(CameraOverlaySize.small.side, 96)
+        XCTAssertEqual(CameraOverlaySize.large.side, 192)
+        let large = CameraOverlayLayout.rect(in: CGRect(x: 0, y: 0, width: 1280, height: 720), size: .large)
+        XCTAssertEqual(large?.size, CGSize(width: 192, height: 192))
+        let clamped = CameraOverlayLayout.rect(in: CGRect(x: 0, y: 0, width: 200, height: 200), size: .large)
+        XCTAssertEqual(clamped?.size, CGSize(width: 176, height: 176))
+        XCTAssertEqual(clamped?.minX, 12)
+        XCTAssertEqual(clamped?.minY, 12)
+        XCTAssertNil(CameraOverlayLayout.rect(in: CGRect(x: 0, y: 0, width: 80, height: 80), size: .small))
+        XCTAssertEqual(CameraOverlayLayout.rect(in: CGRect(x: 0, y: 0, width: 100, height: 100), size: .large)?.size, CGSize(width: 76, height: 76))
+    }
+
+    func testCameraOverlayPreviewAndOutputShareLayoutAtScale() throws {
+        let points = CGRect(x: 0, y: 0, width: 1280, height: 720)
+        let pixels = CGRect(x: 0, y: 0, width: 2560, height: 1440)
+        let preview = try XCTUnwrap(CameraOverlayLayout.rect(in: points, size: .large, scale: 1))
+        let output = try XCTUnwrap(CameraOverlayLayout.rect(in: pixels, size: .large, scale: 2))
+        XCTAssertEqual(preview.origin.x, output.origin.x / 2)
+        XCTAssertEqual(preview.origin.y, output.origin.y / 2)
+        XCTAssertEqual(preview.size.width, output.size.width / 2)
+        XCTAssertEqual(preview.size.height, output.size.height / 2)
+    }
+
+    func testCameraSettingsDefaultsAndRoundTrip() throws {
+        XCTAssertEqual(AppSettings.defaults.cameraSize, .large)
+        XCTAssertTrue(AppSettings.defaults.cameraMirror)
+        XCTAssertFalse(AppSettings.defaults.cameraBackgroundBlur)
+        var settings = AppSettings.defaults
+        settings.cameraSize = .small
+        settings.cameraMirror = false
+        settings.cameraBackgroundBlur = true
+        settings.selectedCameraID = "camera-2"
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertEqual(decoded.cameraSize, .small)
+        XCTAssertFalse(decoded.cameraMirror)
+        XCTAssertTrue(decoded.cameraBackgroundBlur)
+        XCTAssertEqual(decoded.selectedCameraID, "camera-2")
+    }
+
+    func testCameraSettingsFallbackWhenDecodingPreCameraBuilds() throws {
+        let encoded = try JSONEncoder().encode(AppSettings.defaults)
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        var legacy = object
+        legacy.removeValue(forKey: "cameraSizeValue")
+        legacy.removeValue(forKey: "cameraMirrorValue")
+        legacy.removeValue(forKey: "cameraBackgroundBlurValue")
+        legacy.removeValue(forKey: "selectedCameraIDValue")
+        let data = try JSONSerialization.data(withJSONObject: legacy)
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: data)
+        XCTAssertEqual(decoded.cameraSize, .large)
+        XCTAssertTrue(decoded.cameraMirror)
+        XCTAssertFalse(decoded.cameraBackgroundBlur)
+        XCTAssertEqual(decoded.selectedCameraID, "")
     }
 
     func testOutputFilenameUsesRequestedStablePrefixAndTimestampShape() {

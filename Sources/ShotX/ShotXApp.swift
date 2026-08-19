@@ -26,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppFonts.register()
         NSApp.setActivationPolicy(.accessory)
         DispatchQueue.main.async { [weak self] in self?.model?.start() }
         NotificationCenter.default.addObserver(self, selector: #selector(becameActive), name: NSApplication.didBecomeActiveNotification, object: nil)
@@ -49,7 +50,7 @@ private struct CaptureMenu: View {
         }
         Divider()
         if model.recording {
-            Button("停止录制") { RecordingCoordinator.shared.stop() }
+            Button("停止录制 \(model.recordingElapsedText ?? "00:00")") { RecordingCoordinator.shared.stop() }
             Divider()
         }
         Menu("最近一次结果") {
